@@ -4,6 +4,9 @@ target/
 # Build / run logs
 *.log
 
+# EXP29: release staging (zip, setup, hashes) - built, never committed
+dist/
+
 # EXP08 data-generator download cache
 experiments/EXP08/tmp/
 

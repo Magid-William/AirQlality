@@ -82,6 +82,56 @@ jobs:
       - name: dist build
         run: cargo build -p airqlality --profile dist
 
+      # The EXP14 icon only exists inside `OUT_DIR` (build.rs writes it for
+      # `windres`), so write the same bytes to a real file for Inno Setup.
+      # Dev-profile deps are warm from the unit-test steps, so this is cheap.
+      - name: write the setup icon
+        run: cargo run -p airqlality --example emit_icon -- target\AirQlality.ico
+
+      # Inno Setup is NOT on the windows-2025 image (unlike windows-2022), so
+      # install it. ~7 MiB, once per run, on the runner.
+      - name: install Inno Setup
+        shell: pwsh
+        run: |
+          $candidates = 'C:\Program Files (x86)\Inno Setup 6\ISCC.exe',
+                        'C:\Program Files\Inno Setup 6\ISCC.exe'
+          $iscc = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) {
+            choco install innosetup --no-progress -y
+            $iscc = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          }
+          if (-not $iscc) { throw 'ISCC.exe not found after installing Inno Setup' }
+          "ISCC=$iscc" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "using $iscc"
+
+      # One script, two assets: the portable zip below and this setup. The tag's
+      # version is the only version (validated in the first step).
+      - name: build the setup
+        id: setup
+        shell: pwsh
+        run: |
+          $ver = '${{ steps.ver.outputs.version }}'
+          & $env:ISCC "/DAppVersion=$ver" `
+            "/DSourceExe=$PWD\target\dist\airqlality.exe" `
+            "/DSourceIcon=$PWD\target\AirQlality.ico" `
+            installer\airqlality.iss
+          if ($LASTEXITCODE -ne 0) { throw "ISCC failed with $LASTEXITCODE" }
+          $setup = Join-Path 'dist' "AirQlality-v$ver-windows-x64-setup.exe"
+          if (-not (Test-Path $setup)) { throw "missing $setup" }
+          $mb = [math]::Round((Get-Item $setup).Length / 1MB, 1)
+          "setup=$setup" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "setup_mb=$mb" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "built $setup ($mb MiB)"
+
+      # Black-box: silent per-user install into a scratch dir, one ARP entry after
+      # an upgrade, silent uninstall that leaves no exe, shortcut, ARP entry or
+      # autostart value behind - and keeps the user's settings.
+      - name: prove the installer
+        shell: pwsh
+        run: |
+          installer\proof.ps1 -Setup '${{ steps.setup.outputs.setup }}'
+          if ($LASTEXITCODE -ne 0) { throw "installer proof failed" }
+
       - name: package the zip
         id: zip
         shell: pwsh
@@ -98,12 +148,18 @@ jobs:
           $zip = Join-Path 'dist' "$name.zip"
           Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip
           $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
-          "$hash  $name.zip" | Set-Content -Path 'dist\SHA256SUMS.txt' -Encoding ascii
+          $setup = Get-Item '${{ steps.setup.outputs.setup }}'
+          $setupHash = (Get-FileHash $setup.FullName -Algorithm SHA256).Hash.ToLower()
+          @(
+            "$hash  $name.zip"
+            "$setupHash  $($setup.Name)"
+          ) | Set-Content -Path 'dist\SHA256SUMS.txt' -Encoding ascii
           $mb = [math]::Round((Get-Item $zip).Length / 1MB, 1)
           "asset=$zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           "name=$name" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
           "sha256=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
-          "packaged $name.zip ($mb MiB, sha256 $hash)"
+          "setup_sha256=$setupHash" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "packaged $name.zip ($mb MiB, sha256 $hash) + $($setup.Name) (sha256 $setupHash)"
 
       - name: publish the GitHub release
         shell: pwsh
@@ -112,14 +168,15 @@ jobs:
         run: |
           $tag = '${{ steps.ver.outputs.tag }}'
           $title = 'AirQlality ' + '${{ steps.ver.outputs.version }}'
+          $assets = @('${{ steps.setup.outputs.setup }}', '${{ steps.zip.outputs.asset }}', 'dist\SHA256SUMS.txt')
           $existing = gh release view $tag --json tagName 2>$null
           if ($LASTEXITCODE -eq 0 -and $existing) {
             # Re-run of the same tag: replace the assets and notes, never fail on
             # "release already exists".
             gh release edit $tag --title $title --notes-from-tag
-            gh release upload $tag '${{ steps.zip.outputs.asset }}' 'dist\SHA256SUMS.txt' --clobber
+            gh release upload $tag @assets --clobber
           } else {
-            gh release create $tag '${{ steps.zip.outputs.asset }}' 'dist\SHA256SUMS.txt' --verify-tag --title $title --notes-from-tag --latest
+            gh release create $tag @assets --verify-tag --title $title --notes-from-tag --latest
           }
           gh release view $tag --json tagName,url,assets --jq '"released \(.tagName) -> \(.url)"'
 
@@ -127,6 +184,9 @@ jobs:
         shell: pwsh
         run: |
           @"
+          **${{ steps.zip.outputs.name }}-setup.exe** - ${{ steps.setup.outputs.setup_mb }} MiB
+          sha256 ${{ steps.zip.outputs.setup_sha256 }}
+
           **${{ steps.zip.outputs.name }}.zip**
           sha256 ${{ steps.zip.outputs.sha256 }}
           "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append

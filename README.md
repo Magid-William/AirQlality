@@ -52,21 +52,31 @@ never changes the app's state.
 ## Download
 
 [**Latest release**](https://github.com/Magid-William/AirQlality/releases/latest) -
-`AirQlality-v<version>-windows-x64.zip`, for 64-bit Windows 10 (1903 or later) and
-Windows 11. Unzip anywhere and run `airqlality.exe`: no installer, no runtime to
-install, nothing written outside `%APPDATA%\AirQlality` (keys and the last chosen
-location).
+for 64-bit Windows 10 (1903 or later) and Windows 11.
 
-The download is not code-signed, so SmartScreen shows *"Windows protected your
+**Installer (recommended)** - `AirQlality-v<version>-windows-x64-setup.exe`.
+Per-user, so there is no admin prompt: it puts `airqlality.exe` in
+`%LOCALAPPDATA%\Programs\AirQlality`, adds a Start Menu shortcut and an
+Add/Remove Programs entry, and offers a desktop shortcut. Uninstalling removes
+the app and its autostart entry and keeps your settings
+(`%APPDATA%\AirQlality`).
+
+**Portable zip** - `AirQlality-v<version>-windows-x64.zip`. Unzip anywhere and
+run `airqlality.exe`: no installer, no runtime to install, nothing written
+outside `%APPDATA%\AirQlality` (keys and the last chosen location).
+
+Neither download is code-signed, so SmartScreen shows *"Windows protected your
 PC"* on first run - **More info -> Run anyway**. Each release ships a
-`SHA256SUMS.txt` next to the zip:
+`SHA256SUMS.txt` covering both assets:
 
 ```powershell
-Get-FileHash .\AirQlality-*.zip -Algorithm SHA256
+Get-Content .\SHA256SUMS.txt
+Get-FileHash .\AirQlality-*.exe, .\AirQlality-*.zip -Algorithm SHA256
 ```
 
 Releases are built by the `Release` workflow from the tagged commit, after the
-same test suites CI runs.
+same test suites CI runs, and the setup is proven by a silent install/uninstall
+before it is uploaded.
 
 ## Build & run
 
@@ -91,6 +101,19 @@ cargo test -p airqlality --test e2e_widget   # windowed: launches the real widge
 
 The E2E suite spawns the real window and screenshots it, so it flashes windows
 for a few minutes; run it deliberately.
+
+The installer is one Inno Setup 6 script, so it can be built and proven locally
+(the icon has to be written out first, because `build.rs` keeps it in `OUT_DIR`):
+
+```powershell
+cargo run -p airqlality --example emit_icon -- target\AirQlality.ico
+& "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe" /DAppVersion=0.2.0 installer\airqlality.iss
+installer\proof.ps1 -Setup dist\AirQlality-v0.2.0-windows-x64-setup.exe
+```
+
+`installer\proof.ps1` installs silently into a scratch directory, checks the exe,
+the shortcut and the Add/Remove Programs entry, launches the installed widget,
+uninstalls, and asserts nothing (including a lingering autostart value) is left.
 
 ## Data sources
 
