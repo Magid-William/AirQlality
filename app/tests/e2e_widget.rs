@@ -1209,6 +1209,152 @@ fn widget_e2e_notify_is_silent_when_open() {
     let _ = std::fs::remove_file(&dump);
 }
 
+/// EXP27: one balloon per **red segment**, not per evaluation. The synthetic
+/// series walks `[open][vent][closed][closed][vent][closed][vent]` through the
+/// real ticker: the two closed hours are one segment, the later closed hour is a
+/// second, so exactly two notifications - and the two-hour run must not add a
+/// third. `AIRQLALITY_MOCK_PM25` + `AIRQLALITY_TICK_MS` make the pattern play in
+/// seconds; the clean tail keeps the ticker from wrapping back into it.
+#[test]
+fn widget_e2e_notify_once_per_red_segment() {
+    let _guard = window_guard();
+    let exe = env!("CARGO_BIN_EXE_airqlality");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("capture.ps1");
+    let png = std::env::temp_dir().join(format!(
+        "airqlality-e2e-notifyseg-{}.png",
+        std::process::id()
+    ));
+    let dump = std::env::temp_dir().join(format!(
+        "airqlality-e2e-notifyseg-{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&png);
+    let _ = std::fs::remove_file(&dump);
+
+    // 12 open, 20 vent, 30 closed, 30 closed, 20 vent, 35 closed, 20 vent - then
+    // a clean tail the harness cannot reach before it closes the app.
+    let mut pattern = String::from("12,20,30,30,20,35,20");
+    for _ in 0..40 {
+        pattern.push_str(",12");
+    }
+
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&script)
+        .arg("-Exe")
+        .arg(exe)
+        .arg("-Out")
+        .arg(&png)
+        .arg("-WaitSeconds")
+        .arg("3")
+        .env("AIRQLALITY_SOURCE", "mock")
+        .env("AIRQLALITY_MOCK_PM25", &pattern)
+        .env("AIRQLALITY_TICK_MS", "200")
+        .env("AIRQLALITY_NOTIFY_DUMP", &dump)
+        .output()
+        .expect("failed to spawn capture.ps1");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let log = format!("--- capture stdout ---\n{stdout}");
+    assert!(
+        !stdout.contains("PROCESS_EXITED") && stdout.contains("SAVED"),
+        "app did not render:\n{log}"
+    );
+
+    let state = std::fs::read_to_string(&dump)
+        .unwrap_or_else(|e| panic!("notify dump not written ({e}):\n{log}"));
+    eprintln!("e2e notify (segments): {state}");
+    let lines: Vec<&str> = state.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "two red segments must warn exactly twice, however long each runs:\n{state}"
+    );
+    for line in &lines {
+        assert!(
+            line.contains("\"ok\":true"),
+            "Shell_NotifyIcon(NIF_INFO) was rejected:\n{state}"
+        );
+    }
+    assert!(
+        lines[0].contains("\"body\":\"Cairo, Egypt \u{b7} PM2.5 30 ")
+            && lines[1].contains("\"body\":\"Cairo, Egypt \u{b7} PM2.5 35 "),
+        "each warning must describe the reading that started its segment:\n{state}"
+    );
+
+    let _ = std::fs::remove_file(&png);
+    let _ = std::fs::remove_file(&dump);
+}
+
+/// EXP27: the other half - a long closed run is still **one** segment. Six
+/// closed hours in a row produce exactly one notification, never one per refresh
+/// or per hour.
+#[test]
+fn widget_e2e_notify_long_red_run_is_one_warning() {
+    let _guard = window_guard();
+    let exe = env!("CARGO_BIN_EXE_airqlality");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("capture.ps1");
+    let png = std::env::temp_dir().join(format!(
+        "airqlality-e2e-notifylong-{}.png",
+        std::process::id()
+    ));
+    let dump = std::env::temp_dir().join(format!(
+        "airqlality-e2e-notifylong-{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&png);
+    let _ = std::fs::remove_file(&dump);
+
+    let mut pattern = String::from("12,20,30,30,30,30,30,30");
+    for _ in 0..40 {
+        pattern.push_str(",12");
+    }
+
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&script)
+        .arg("-Exe")
+        .arg(exe)
+        .arg("-Out")
+        .arg(&png)
+        .arg("-WaitSeconds")
+        .arg("3")
+        .env("AIRQLALITY_SOURCE", "mock")
+        .env("AIRQLALITY_MOCK_PM25", &pattern)
+        .env("AIRQLALITY_TICK_MS", "200")
+        .env("AIRQLALITY_NOTIFY_DUMP", &dump)
+        .output()
+        .expect("failed to spawn capture.ps1");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let log = format!("--- capture stdout ---\n{stdout}");
+    assert!(
+        !stdout.contains("PROCESS_EXITED") && stdout.contains("SAVED"),
+        "app did not render:\n{log}"
+    );
+
+    let state = std::fs::read_to_string(&dump)
+        .unwrap_or_else(|e| panic!("notify dump not written ({e}):\n{log}"));
+    eprintln!("e2e notify (long run): {state}");
+    let lines: Vec<&str> = state.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "a long closed run is one segment, so one warning:\n{state}"
+    );
+    assert!(
+        lines[0].contains("\"ok\":true"),
+        "Shell_NotifyIcon(NIF_INFO) was rejected:\n{state}"
+    );
+
+    let _ = std::fs::remove_file(&png);
+    let _ = std::fs::remove_file(&dump);
+}
+
 /// The inferred noise overlay (EXP16). With `AIRQLALITY_NOISE=on` a second,
 /// violet curve is painted on the timeline; the default (off under the mock
 /// seam) paints none, so the pre-EXP16 screenshots stay byte-identical. Runs

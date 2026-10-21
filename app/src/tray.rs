@@ -76,20 +76,19 @@ static TRAY_READY: AtomicBool = AtomicBool::new(false);
 struct State {
     color: u32,
     tip: String,
-    /// Verdict of the last evaluation, so the notification gate can
-    /// edge-trigger (EXP17). `None` is "no reading yet", so a cold start into
-    /// `KeepClosed` warns exactly once.
-    last_verdict: Option<Verdict>,
-    /// A balloon waiting for the tray icon to exist: (title, body). Sent by
-    /// `add_icon`/`refresh_icon`, then cleared (EXP17).
-    pending: Option<(String, String)>,
+    /// The warning decision (EXP17, EXP27): one balloon per `KeepClosed` run,
+    /// however many refreshes land inside it.
+    gate: notify::Gate,
+    /// A balloon waiting for the tray icon to exist: (title, body, hour). Sent
+    /// by `add_icon`/`refresh_icon`, then cleared (EXP17).
+    pending: Option<(String, String, i64)>,
 }
 
 /// The desired icon, shared between the UI thread (writer) and tray thread.
 static STATE: Mutex<State> = Mutex::new(State {
     color: theme::MUTED,
     tip: String::new(),
-    last_verdict: None,
+    gate: notify::Gate::new(),
     pending: None,
 });
 
@@ -137,9 +136,12 @@ pub fn start(window_hwnd: isize) {
         .spawn(move || unsafe { run(window_hwnd) });
 }
 
-/// Point the icon at a verdict: colour + tooltip, and warn the user if this is a
-/// fresh transition into `KeepClosed` (EXP17).
-pub fn set_verdict(verdict: Verdict, location: &str, pm2_5: f32) {
+/// Point the icon at a verdict: colour + tooltip, and warn the user if this
+/// reading starts a fresh `KeepClosed` run (EXP17, EXP27).
+///
+/// `hour` is the unix-hour bucket of the *reading* (`series.now().time`), not
+/// the wall clock: a refresh that re-evaluates the same hour is not a new run.
+pub fn set_verdict(verdict: Verdict, location: &str, pm2_5: f32, hour: i64) {
     {
         let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
         state.color = color_for(verdict);
@@ -147,24 +149,23 @@ pub fn set_verdict(verdict: Verdict, location: &str, pm2_5: f32) {
             "AirQlality \u{00b7} {location} \u{00b7} {}",
             verdict.label()
         );
-        let previous = state.last_verdict;
-        state.last_verdict = Some(verdict);
-        if notify::should_notify(previous, verdict) {
-            state.pending = Some(notify::message(location, pm2_5));
+        if state.gate.observe(verdict, hour) {
+            let (title, body) = notify::message(location, pm2_5);
+            state.pending = Some((title, body, hour));
         }
     }
     nudge();
 }
 
 /// Muted grey while a freshly selected location is fetching. Forgets the last
-/// verdict, so the next closed reading is a new spell: a location switch should
+/// run, so the next closed reading is a new segment: a location switch should
 /// warn even if the old location was closed too (EXP17).
 pub fn set_loading(location: &str) {
     {
         let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
         state.color = theme::MUTED;
         state.tip = format!("AirQlality \u{00b7} {location} \u{00b7} fetching\u{2026}");
-        state.last_verdict = None;
+        state.gate.reset();
         // Drop any not-yet-shown warning: it names the previous location.
         state.pending = None;
     }
@@ -173,9 +174,9 @@ pub fn set_loading(location: &str) {
 
 /// Muted grey + "refreshing..." while a manual refresh is in flight (EXP22).
 ///
-/// Unlike [`set_loading`] this **keeps** `last_verdict` (and any queued
-/// balloon): a refresh that finds the same closed reading is not a new closed
-/// spell, so it must not warn the user twice.
+/// Unlike [`set_loading`] this **keeps** the gate (and any queued balloon): a
+/// refresh that finds the same closed reading is not a new closed run, so it
+/// must not warn the user twice.
 pub fn set_refreshing(location: &str) {
     {
         let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -539,13 +540,13 @@ unsafe fn refresh_icon(hwnd: HWND) {
 }
 
 /// Send a queued balloon notification (`NIF_INFO`) and clear it, so it is never
-/// shown twice (EXP17). A fresh closed spell queues a new one.
+/// shown twice (EXP17). A fresh closed run queues a new one.
 unsafe fn flush_pending(hwnd: HWND) {
     let info = {
         let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
         state.pending.take()
     };
-    let Some((title, body)) = info else {
+    let Some((title, body, hour)) = info else {
         return;
     };
     let mut nid = base_nid(hwnd);
@@ -556,7 +557,7 @@ unsafe fn flush_pending(hwnd: HWND) {
     // notification sound.
     nid.dwInfoFlags = NIIF_WARNING | NIIF_RESPECT_QUIET_TIME;
     let ok = Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool();
-    dump_notify(&title, &body, ok);
+    dump_notify(&title, &body, hour, ok);
 }
 
 /// `NIM_DELETE` the icon (called from `WM_DESTROY`).
@@ -677,14 +678,15 @@ fn dump(color: u32, tip: &str, ok: bool) {
 
 /// Test seam: with `AIRQLALITY_NOTIFY_DUMP=<path>`, append one JSON line per
 /// balloon actually sent, so the E2E can assert the gate fired and the shell
-/// accepted the call, at the Win32 boundary (EXP17).
-fn dump_notify(title: &str, body: &str, ok: bool) {
+/// accepted the call, at the Win32 boundary (EXP17, EXP27). `hour` is the
+/// reading's unix-hour bucket, so a test can also say *when* it fired.
+fn dump_notify(title: &str, body: &str, hour: i64, ok: bool) {
     let Some(path) = std::env::var_os("AIRQLALITY_NOTIFY_DUMP") else {
         return;
     };
     let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
     let line = format!(
-        "{{\"verdict\":\"KEEP CLOSED\",\"title\":\"{}\",\"body\":\"{}\",\"ok\":{ok}}}\n",
+        "{{\"verdict\":\"KEEP CLOSED\",\"hour\":{hour},\"title\":\"{}\",\"body\":\"{}\",\"ok\":{ok}}}\n",
         esc(title),
         esc(body)
     );
@@ -758,27 +760,36 @@ mod tests {
     }
 
     #[test]
-    fn a_refresh_keeps_the_verdict_and_a_loading_forgets_it() {
+    fn a_refresh_keeps_the_run_and_a_loading_forgets_it() {
         // Both states are muted, but only `set_loading` starts a new closed
-        // spell. Checked on the shared state so the notification gate (EXP17)
-        // cannot regress silently.
-        set_verdict(Verdict::KeepClosed, "Cairo, Egypt", 26.0);
+        // run. Checked on the shared state so the notification gate (EXP17,
+        // EXP27) cannot regress silently.
+        set_verdict(Verdict::KeepClosed, "Cairo, Egypt", 26.0, 100);
         {
             let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
             state.pending = None; // drop the balloon this call queued
+            assert_ne!(state.gate, notify::Gate::new());
         }
         set_refreshing("Cairo, Egypt");
         {
             let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
             assert_eq!(state.color, theme::MUTED);
-            assert_eq!(state.last_verdict, Some(Verdict::KeepClosed));
+            assert_ne!(
+                state.gate,
+                notify::Gate::new(),
+                "a refresh must not forget the closed run"
+            );
             assert!(state.pending.is_none());
             assert!(state.tip.contains("refreshing"));
         }
         set_loading("Cairo, Egypt");
         {
             let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
-            assert_eq!(state.last_verdict, None);
+            assert_eq!(
+                state.gate,
+                notify::Gate::new(),
+                "a location switch is a new run"
+            );
         }
     }
 }

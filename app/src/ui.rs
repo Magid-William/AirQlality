@@ -5,10 +5,10 @@
 //! stays dependency-free.
 
 use airqlality_core::{
-    AirQualitySource, City, DAY_END_HOUR, DAY_START_HOUR, Decision, Kind, Location, MAX_DB, MIN_DB,
-    MockSource, OpenAqSource, OpenMeteoSource, OpenWeatherMapSource, SEARCH_LIMIT, Series,
-    SourceError, SourceSeries, Spread, Stack, Thresholds, Verdict, align_to_series, city_by_id,
-    country_name, estimate_for_city, evaluate, mock_stack, night_curve, search,
+    AirQualityPoint, AirQualitySource, City, DAY_END_HOUR, DAY_START_HOUR, Decision, Kind, Location,
+    MAX_DB, MIN_DB, MockSource, OpenAqSource, OpenMeteoSource, OpenWeatherMapSource, SEARCH_LIMIT,
+    Series, SourceError, SourceSeries, Spread, Stack, Thresholds, Verdict, align_to_series,
+    city_by_id, country_name, estimate_for_city, evaluate, mock_stack, night_curve, search,
     stack as fuse_stack,
 };
 use gpui::{
@@ -135,6 +135,48 @@ fn use_mock_stack() -> bool {
         std::env::var("AIRQLALITY_SOURCES").ok().as_deref(),
         Some("mock3")
     )
+}
+
+/// How often the demo ticker advances one hour (EXP27). Three seconds by
+/// default; a test can speed it up so a crafted sequence plays in about a
+/// second instead of minutes.
+fn tick_period() -> Duration {
+    std::env::var("AIRQLALITY_TICK_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map(Duration::from_millis)
+        .unwrap_or(TICK)
+}
+
+/// Test seam (EXP27): `AIRQLALITY_MOCK_PM25="12,20,30,30,20,30,20"` builds a
+/// synthetic hourly series with "now" on the first value, so the windowed E2E
+/// can walk an exact verdict pattern through the real app and count balloons.
+/// The other air-quality fields are filled from PM2.5; nothing in that test
+/// reads them.
+fn mock_pm2_5_series(location: &str) -> Option<Series> {
+    let raw = std::env::var("AIRQLALITY_MOCK_PM25").ok()?;
+    let values: Vec<f32> = raw
+        .split(',')
+        .filter_map(|v| v.trim().parse::<f32>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0)
+        .collect();
+    if values.is_empty() {
+        return None;
+    }
+    let start = chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00+02:00").ok()?;
+    let points = values
+        .into_iter()
+        .enumerate()
+        .map(|(hour, pm2_5)| AirQualityPoint {
+            time: start + chrono::Duration::hours(hour as i64),
+            pm2_5,
+            pm10: pm2_5 * 1.6,
+            us_aqi: pm2_5 * 4.0,
+            wind_speed: 10.0,
+        })
+        .collect();
+    Some(Series::new(location, points, 0))
 }
 
 /// The inferred hourly noise estimate (dB(A)) for a location, or `None` when the
@@ -389,7 +431,10 @@ impl Widget {
                 // accelerated ticker. Set AIRQLALITY_FREEZE_NOW to stop it (the E2E
                 // does, so its screenshot stays byte-identical). AIRQLALITY_MOCK_NOW
                 // pins the starting hour (the EXP11 E2E uses it to reach an Open one).
-                let mut series = MockSource.fetch().expect("mock source is infallible");
+                // AIRQLALITY_MOCK_PM25 replaces the mock with a crafted sequence
+                // (EXP27, notification segments).
+                let mut series = mock_pm2_5_series(&widget.selected.label)
+                    .unwrap_or_else(|| MockSource.fetch().expect("mock source is infallible"));
                 if let Some(i) = std::env::var("AIRQLALITY_MOCK_NOW")
                     .ok()
                     .and_then(|s| s.parse::<usize>().ok())
@@ -400,9 +445,10 @@ impl Widget {
                 }
                 widget.set_series(series);
                 if std::env::var_os("AIRQLALITY_FREEZE_NOW").is_none() {
+                    let tick = tick_period();
                     cx.spawn(async move |this, cx| {
                         loop {
-                            cx.background_executor().timer(TICK).await;
+                            cx.background_executor().timer(tick).await;
                             let alive = this.update(cx, |widget, cx| {
                                 widget.tick();
                                 cx.notify();
@@ -1108,7 +1154,12 @@ impl Widget {
 
     fn set_series(&mut self, series: Series) {
         let decision = evaluate(&series, &self.thresholds);
-        tray_set_verdict(decision.headline, &self.selected.label, series.now().pm2_5);
+        tray_set_verdict(
+            decision.headline,
+            &self.selected.label,
+            series.now().pm2_5,
+            hour_bucket(&series.now().time),
+        );
         self.decision = Some(decision);
         self.series = Some(series);
     }
@@ -1182,7 +1233,8 @@ impl Widget {
         match fuse_stack(sources, &self.thresholds) {
             Ok(stack) => {
                 let pm2_5 = stack.fusion.series.now().pm2_5;
-                tray_set_verdict(stack.decision.headline, &self.selected.label, pm2_5);
+                let hour = hour_bucket(&stack.fusion.series.now().time);
+                tray_set_verdict(stack.decision.headline, &self.selected.label, pm2_5, hour);
                 self.series = Some(stack.fusion.series.clone());
                 self.decision = Some(stack.decision.clone());
                 self.stack = Some(stack);
@@ -1220,7 +1272,12 @@ impl Widget {
         }
         if let Some(series) = self.series.as_ref() {
             let decision = evaluate(series, &self.thresholds);
-            tray_set_verdict(decision.headline, &self.selected.label, series.now().pm2_5);
+            tray_set_verdict(
+                decision.headline,
+                &self.selected.label,
+                series.now().pm2_5,
+                hour_bucket(&series.now().time),
+            );
             self.decision = Some(decision);
         }
     }
@@ -2120,13 +2177,23 @@ fn legend_row(square: impl IntoElement, label: &'static str) -> impl IntoElement
 
 /// Push the current verdict to the Windows tray icon (no-op elsewhere). Kept
 /// behind a helper so the Windows-only call is invisible to the view code.
+///
+/// `hour` is the unix-hour bucket of the reading the verdict came from (EXP27):
+/// the notification gate must see a repeated hour as the same red segment, not
+/// as a new one.
 #[cfg(windows)]
-fn tray_set_verdict(verdict: Verdict, location: &str, pm2_5: f32) {
-    crate::tray::set_verdict(verdict, location, pm2_5);
+fn tray_set_verdict(verdict: Verdict, location: &str, pm2_5: f32, hour: i64) {
+    crate::tray::set_verdict(verdict, location, pm2_5, hour);
 }
 
 #[cfg(not(windows))]
-fn tray_set_verdict(_verdict: Verdict, _location: &str, _pm2_5: f32) {}
+fn tray_set_verdict(_verdict: Verdict, _location: &str, _pm2_5: f32, _hour: i64) {}
+
+/// The unix-hour bucket of one series point, the unit the notification gate
+/// segments red runs by (EXP27).
+fn hour_bucket(time: &chrono::DateTime<chrono::FixedOffset>) -> i64 {
+    time.timestamp() / 3600
+}
 
 /// Show the tray's muted "fetching" state while a new location loads.
 #[cfg(windows)]
