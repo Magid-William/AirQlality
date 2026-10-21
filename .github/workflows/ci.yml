@@ -1,0 +1,119 @@
+name: CI
+
+# Every push on every branch and every pull request (EXP26). The gates are the
+# same ones the experiments ran by hand: format, the two fast test suites, and a
+# real release build. The windowed E2E suite is deliberately NOT a gate - it
+# needs a desktop and a GPU and takes ~250 s; `workflow_dispatch` runs it as a
+# probe instead, so we learn whether hosted runners can do it at all.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  # A new push to the same branch supersedes the old run: no queue of dead builds.
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Silence the "newer rustc available" nags from the pinned toolchain.
+  RUSTUP_TOOLCHAIN: stable-x86_64-pc-windows-gnu
+
+jobs:
+  build:
+    name: fmt + tests + release build
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      # The runner image ships MSYS2 with mingw-w64 gcc 15.2, but not on PATH.
+      # `psm` needs `gcc` and `build.rs` needs `windres`; both are hard failures
+      # if this step does not find them, so the error names the cause.
+      - name: Put MinGW on PATH
+        shell: pwsh
+        run: |
+          $mingw = 'C:\msys64\mingw64\bin'
+          foreach ($tool in 'gcc.exe', 'windres.exe') {
+            if (-not (Test-Path (Join-Path $mingw $tool))) {
+              throw "MinGW tool missing: $mingw\$tool - the runner image changed; fix the path here."
+            }
+          }
+          $mingw | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          $env:PATH = "$mingw;$env:PATH"
+          gcc --version | Select-Object -First 1
+          windres --version | Select-Object -First 1
+
+      # `rust-toolchain.toml` pins stable-x86_64-pc-windows-gnu; install it
+      # explicitly (minimal + the two components we call) so the first cargo
+      # invocation does not download a default profile we never use.
+      - name: Install the pinned GNU toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal --component rustfmt --component clippy
+          rustc --version --verbose
+          cargo --version
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The tree is hand-formatted and does not match rustfmt (a `--check` diff
+      # spans most of `core/` and `app/`); adopting rustfmt is its own experiment,
+      # so this reports and does not block. Same for clippy.
+      - name: cargo fmt --check (report only)
+        continue-on-error: true
+        run: cargo fmt --all --check
+
+      # Fast suites first: a logic regression should not wait for the gpui build.
+      - name: core tests
+        run: cargo test -p airqlality-core
+
+      - name: app unit tests
+        run: cargo test -p airqlality --bin airqlality
+
+      # Clippy has never gated this project; report it without blocking a merge
+      # until the tree is clean (a later experiment can promote it).
+      - name: clippy (non-blocking)
+        continue-on-error: true
+        run: cargo clippy -p airqlality-core -p airqlality --all-targets
+
+      - name: release build
+        run: cargo build -p airqlality --release
+
+      # The release asset is a single exe. Prove that claim instead of trusting
+      # the local `objdump` run: a MinGW runtime import would break every machine
+      # without the toolchain installed.
+      - name: release exe is self-contained
+        shell: pwsh
+        run: |
+          $exe = 'target\release\airqlality.exe'
+          if (-not (Test-Path $exe)) { throw "missing $exe" }
+          $imports = & objdump -p $exe |
+            Select-String 'DLL Name:' |
+            ForEach-Object { ($_ -split 'DLL Name:')[1].Trim() }
+          $toolchain = $imports | Where-Object { $_ -match '^(libgcc|libstdc|libwinpthread)' }
+          if ($toolchain) { throw "needs toolchain DLLs: $($toolchain -join ', ')" }
+          $size = [math]::Round((Get-Item $exe).Length / 1MB, 1)
+          "ok: $($imports.Count) system imports, no MinGW runtime, $size MiB"
+
+  # Manual probe: can a hosted runner run the real widget? The suite launches the
+  # window, screenshots it and asserts exact pixels, so it needs an interactive
+  # desktop and a usable D3D adapter. Expect this to be red; a green run means we
+  # can promote it to a nightly gate.
+  e2e:
+    name: windowed E2E (probe, manual only)
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Put MinGW on PATH
+        shell: pwsh
+        run: |
+          'C:\msys64\mingw64\bin' | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - uses: Swatinem/rust-cache@v2
+      - name: windowed E2E
+        run: cargo test -p airqlality --test e2e_widget -- --test-threads=1

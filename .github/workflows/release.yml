@@ -1,0 +1,127 @@
+name: Release
+
+# A tag is the release trigger (EXP26): `git tag -a v0.1.0 -m "<notes>"` then
+# `git push origin v0.1.0`. The tag annotation becomes the release notes, so the
+# story of a build lives in git next to the commit it describes, not only on the
+# website. `workflow_dispatch` re-publishes an existing tag (clobbering assets).
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to publish, e.g. v0.1.0'
+        required: true
+
+permissions:
+  contents: write # create the release and upload assets
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTUP_TOOLCHAIN: stable-x86_64-pc-windows-gnu
+
+jobs:
+  release:
+    name: build and publish ${{ github.ref_name }}
+    runs-on: windows-2025
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history + tags: `--notes-from-tag` reads the annotated tag object.
+          fetch-depth: 0
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      # A release must never carry a version the crate does not claim. The tag is
+      # the single source of truth; `Cargo.toml` has to agree or we stop here.
+      - name: tag matches Cargo.toml
+        id: ver
+        shell: pwsh
+        run: |
+          $tag = '${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}'.Trim()
+          if ($tag -notmatch '^v(\d+\.\d+\.\d+)$') { throw "tag '$tag' is not v<major>.<minor>.<patch>" }
+          $ver = $Matches[1]
+          $manifest = Get-Content Cargo.toml -Raw
+          $declared = [regex]::Match($manifest, '(?ms)^\[workspace\.package\].*?^version\s*=\s*"([^"]+)"').Groups[1].Value
+          if (-not $declared) { throw 'no version in [workspace.package]' }
+          if ($declared -ne $ver) { throw "tag says $ver, Cargo.toml says $declared - bump one of them" }
+          "version=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "release $tag (version $ver) agrees with Cargo.toml"
+
+      - name: Put MinGW on PATH
+        shell: pwsh
+        run: |
+          $mingw = 'C:\msys64\mingw64\bin'
+          foreach ($tool in 'gcc.exe', 'windres.exe') {
+            if (-not (Test-Path (Join-Path $mingw $tool))) {
+              throw "MinGW tool missing: $mingw\$tool - the runner image changed; fix the path here."
+            }
+          }
+          $mingw | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Install the pinned GNU toolchain
+        shell: pwsh
+        run: rustup toolchain install stable-x86_64-pc-windows-gnu --profile minimal
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Never ship from a red tree, even if CI was green on an earlier commit.
+      - name: core tests
+        run: cargo test -p airqlality-core
+
+      - name: app unit tests
+        run: cargo test -p airqlality --bin airqlality
+
+      - name: release build
+        run: cargo build -p airqlality --release
+
+      - name: package the zip
+        id: zip
+        shell: pwsh
+        run: |
+          $ver = '${{ steps.ver.outputs.version }}'
+          $name = "AirQlality-v$ver-windows-x64"
+          $stage = Join-Path 'dist' $name
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          Copy-Item 'target\release\airqlality.exe' $stage
+          foreach ($doc in 'README.md', 'LICENSE', 'NOTICE') {
+            if (-not (Test-Path $doc)) { throw "missing $doc" }
+            Copy-Item $doc $stage
+          }
+          $zip = Join-Path 'dist' "$name.zip"
+          Compress-Archive -Path (Join-Path $stage '*') -DestinationPath $zip
+          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLower()
+          "$hash  $name.zip" | Set-Content -Path 'dist\SHA256SUMS.txt' -Encoding ascii
+          $mb = [math]::Round((Get-Item $zip).Length / 1MB, 1)
+          "asset=$zip" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "name=$name" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "sha256=$hash" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "packaged $name.zip ($mb MiB, sha256 $hash)"
+
+      - name: publish the GitHub release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = '${{ steps.ver.outputs.tag }}'
+          $title = 'AirQlality ' + '${{ steps.ver.outputs.version }}'
+          $existing = gh release view $tag --json tagName 2>$null
+          if ($LASTEXITCODE -eq 0 -and $existing) {
+            # Re-run of the same tag: replace the assets and notes, never fail on
+            # "release already exists".
+            gh release edit $tag --title $title --notes-from-tag
+            gh release upload $tag '${{ steps.zip.outputs.asset }}' 'dist\SHA256SUMS.txt' --clobber
+          } else {
+            gh release create $tag '${{ steps.zip.outputs.asset }}' 'dist\SHA256SUMS.txt' --verify-tag --title $title --notes-from-tag --latest
+          }
+          gh release view $tag --json tagName,url,assets --jq '"released \(.tagName) -> \(.url)"'
+
+      - name: summary
+        shell: pwsh
+        run: |
+          @"
+          **${{ steps.zip.outputs.name }}.zip**
+          sha256 ${{ steps.zip.outputs.sha256 }}
+          "@ | Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Encoding utf8 -Append

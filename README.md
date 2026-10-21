@@ -2,6 +2,10 @@
 
 # AirQlality
 
+[![CI](https://github.com/Magid-William/AirQlality/actions/workflows/ci.yml/badge.svg)](https://github.com/Magid-William/AirQlality/actions/workflows/ci.yml)
+[![latest release](https://img.shields.io/github/v/release/Magid-William/AirQlality)](https://github.com/Magid-William/AirQlality/releases/latest)
+[![licence: MIT](https://img.shields.io/badge/licence-MIT-blue.svg)](LICENSE)
+
 A small Windows widget that answers one question well: **is it safe to open the
 window for fresh air, and when?**
 
@@ -45,9 +49,28 @@ below 25, **closed** above that. With several sources, the per-hour value is the
 verdict, labelled "sources disagree". Missing a key only removes a source; it
 never changes the app's state.
 
+## Download
+
+[**Latest release**](https://github.com/Magid-William/AirQlality/releases/latest) -
+`AirQlality-v<version>-windows-x64.zip`, for 64-bit Windows 10 (1903 or later) and
+Windows 11. Unzip anywhere and run `airqlality.exe`: no installer, no runtime to
+install, nothing written outside `%APPDATA%\AirQlality` (keys and the last chosen
+location).
+
+The download is not code-signed, so SmartScreen shows *"Windows protected your
+PC"* on first run - **More info -> Run anyway**. Each release ships a
+`SHA256SUMS.txt` next to the zip:
+
+```powershell
+Get-FileHash .\AirQlality-*.zip -Algorithm SHA256
+```
+
+Releases are built by the `Release` workflow from the tagged commit, after the
+same test suites CI runs.
+
 ## Build & run
 
-Requirements: Windows, the Rust stable GNU toolchain
+Rather build it yourself? Requirements: Windows, the Rust stable GNU toolchain
 (`rust-toolchain.toml` pins `stable-x86_64-pc-windows-gnu`), and **MinGW-w64 on
 `PATH`** (`gcc` and `windres` are used by `psm` and by the icon build step).
 
