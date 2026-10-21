@@ -56,6 +56,10 @@ before it can be released.
   `gh release view v0.1.0` lists both assets; (4) the zip downloaded to a temp
   directory, unzipped, hash checked, and the exe launched with `PATH` reduced to
   `System32`, screenshot showing real Cairo data; (5) `gh run view` timings.
+  Results: cold CI run `39648321358` green in 17m43s - core 64/64, app 67/67,
+  release build, `59 system imports, no MinGW runtime, 32.5 MiB`; the red probe
+  (`19da922`, branch deleted afterwards) failed at `core tests` with the later
+  steps skipped.
 - **May touch:** `.github/workflows/`, `experiments/EXP26/`, `experiments-overview.md`,
   `README.md`, tag `v0.1.0`, the GitHub release, repository Actions settings.
 - **Off-limits:** `core/` and `app/` source and tests (no code changes at all,
