@@ -40,7 +40,13 @@ pub(crate) fn get_redacted(
         req = req.set(name, value);
     }
     req.call()
-        .map_err(|e| SourceError::Network(describe(&e, secrets)))?
+        .map_err(|e| match &e {
+            // 401/403 is the provider refusing the key, not the network.
+            ureq::Error::Status(code, _) if *code == 401 || *code == 403 => {
+                SourceError::Rejected(format!("HTTP {code}"))
+            }
+            _ => SourceError::Network(describe(&e, secrets)),
+        })?
         .into_string()
         .map_err(|e| SourceError::Network(scrub(&e.to_string(), secrets)))
 }

@@ -55,6 +55,13 @@ impl OpenWeatherMapSource {
         })
     }
 
+    /// Check the key with one cheap request, without parsing a series (EXP24).
+    /// `Ok(())` means the provider accepted the credential; a 401/403 comes back
+    /// as [`SourceError::Rejected`].
+    pub fn check_key(&self) -> Result<(), SourceError> {
+        http::get_redacted(&self.agent, &self.url(), &[], &[self.key.as_str()]).map(|_| ())
+    }
+
     /// The forecast URL (public so it can be logged/inspected). The key is a
     /// query parameter, as the API requires.
     pub fn url(&self) -> String {

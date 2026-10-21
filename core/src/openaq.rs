@@ -72,6 +72,15 @@ impl OpenAqSource {
         })
     }
 
+    /// Check the key with one cheap request, without parsing a series (EXP24).
+    /// `Ok(())` means the provider accepted the credential; a 401/403 comes back
+    /// as [`SourceError::Rejected`].
+    pub fn check_key(&self) -> Result<(), SourceError> {
+        let auth = [("X-API-Key", self.key.as_str())];
+        let secret = [self.key.as_str()];
+        http::get_redacted(&self.agent, &self.stations_url(), &auth, &secret).map(|_| ())
+    }
+
     /// The nearest-station lookup URL (public so it can be logged/inspected).
     pub fn stations_url(&self) -> String {
         let (min_lon, min_lat) = (self.longitude - BOX_DEG, self.latitude - BOX_DEG);

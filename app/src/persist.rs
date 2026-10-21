@@ -63,10 +63,7 @@ pub struct Keys {
 /// Read the keys from `%APPDATA%\AirQlality\config.json`, letting environment
 /// variables win so a key can be tried without writing a file.
 pub fn load_keys() -> Keys {
-    let mut keys = keys_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .map(|text| parse_keys(&text))
-        .unwrap_or_default();
+    let mut keys = load_file_keys();
     if let Some(value) = env_key("AIRQLALITY_OPENAQ_KEY") {
         keys.openaq = Some(value);
     }
@@ -74,6 +71,62 @@ pub fn load_keys() -> Keys {
         keys.owm = Some(value);
     }
     keys
+}
+
+/// Read only the file's keys, without the environment override. The key prompts
+/// (EXP24) show this state, because saving a file key cannot change a key that
+/// an environment variable is already overriding.
+pub fn load_file_keys() -> Keys {
+    keys_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|text| parse_keys(&text))
+        .unwrap_or_default()
+}
+
+/// Write the keys to `%APPDATA%\AirQlality\config.json`, preserving every other
+/// field in the file and removing the fields of keys that are now `None`.
+///
+/// Written to a temporary file and renamed into place: a crash mid-write can
+/// leave the old config, never a truncated one. Every failure is ignored and
+/// never surfaced (the file is a convenience, not a contract), like
+/// [`save`](self::save) for the location.
+pub fn save_keys(keys: &Keys) {
+    let Some(path) = keys_path() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let text = merge_keys(&existing, keys);
+    // Same directory, so the rename stays on one volume and is atomic enough
+    // for a bytes-sized config.
+    let tmp = path.with_file_name("config.json.tmp");
+    if std::fs::write(&tmp, text).is_err() {
+        return;
+    }
+    if std::fs::rename(&tmp, &path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+/// Pure: fold our two fields into whatever JSON object is already in the file.
+/// Unknown fields survive, a missing/blank key removes its field, and anything
+/// that is not a JSON object is replaced rather than merged.
+fn merge_keys(existing_json: &str, keys: &Keys) -> String {
+    let mut object = match serde_json::from_str::<serde_json::Value>(existing_json) {
+        Ok(serde_json::Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    };
+    for (name, value) in [("openaq_key", &keys.openaq), ("owm_key", &keys.owm)] {
+        match value.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(key) => {
+                object.insert(name.to_string(), serde_json::Value::String(key.to_string()));
+            }
+            None => {
+                object.remove(name);
+            }
+        }
+    }
+    serde_json::Value::Object(object).to_string()
 }
 
 fn env_key(name: &str) -> Option<String> {
@@ -137,5 +190,49 @@ mod tests {
         assert_eq!(parse_keys("{ not json"), Keys::default());
         assert_eq!(parse_keys(""), Keys::default());
         assert_eq!(parse_keys(r#"{"openaq_key": 5}"#), Keys::default());
+    }
+
+    fn both() -> Keys {
+        Keys {
+            openaq: Some("0123456789abcdef".into()),
+            owm: Some("fedcba9876543210".into()),
+        }
+    }
+
+    #[test]
+    fn saving_merges_into_the_existing_file_and_keeps_unknown_fields() {
+        let merged = merge_keys(r#"{"owm_key": "old", "future": 7}"#, &both());
+        let value: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(value["openaq_key"], "0123456789abcdef");
+        assert_eq!(value["owm_key"], "fedcba9876543210");
+        assert_eq!(value["future"], 7, "fields this app does not know survive");
+    }
+
+    #[test]
+    fn a_missing_key_removes_its_field_rather_than_writing_a_blank() {
+        let keys = Keys {
+            openaq: None,
+            owm: Some("fedcba9876543210".into()),
+        };
+        let merged = merge_keys(r#"{"openaq_key": "old", "owm_key": "old"}"#, &keys);
+        let value: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert!(value.get("openaq_key").is_none());
+        assert_eq!(value["owm_key"], "fedcba9876543210");
+    }
+
+    #[test]
+    fn a_blank_or_broken_file_is_replaced_cleanly() {
+        for existing in ["", "{ not json", "[]", r#"{"openaq_key": 5}"#] {
+            let merged = merge_keys(existing, &both());
+            assert_eq!(parse_keys(&merged), both(), "merging {existing:?}");
+        }
+    }
+
+    #[test]
+    fn what_the_prompt_saves_is_what_the_sources_read() {
+        let saved = merge_keys("", &both());
+        let file = parse_keys(&saved);
+        assert_eq!(file.openaq.as_deref(), Some("0123456789abcdef"));
+        assert_eq!(file.owm.as_deref(), Some("fedcba9876543210"));
     }
 }

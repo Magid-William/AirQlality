@@ -707,7 +707,8 @@ fn widget_e2e_accessibility_tree() {
         "\"role\": \"Label\"",
         "\"label\": \"KEEP CLOSED\"",
         "\"role\": \"Image\"",
-        "\"tab_stop_count\": 2",
+        // Trigger, API keys, search field (EXP24 added the keys button).
+        "\"tab_stop_count\": 3",
     ] {
         assert!(
             doc.contains(needle),
@@ -1469,9 +1470,9 @@ fn widget_e2e_stacked_sources_show_disagreement() {
 /// The tray's "Refresh" (EXP22): the widget's real source is pointed at a
 /// loopback server that answers the **first** request with `503` and the second
 /// with the committed Open-Meteo fixture. `AIRQLALITY_TRAY_REFRESH_MS` fires the
-/// same `refresh::request()` the menu item does, so the widget must fetch again
-/// immediately and render data - not the red "COULDN'T FETCH" screen - without a
-/// restart and without waiting for the next `:00`/`:30`.
+/// same `commands::request(Command::Refresh)` the menu item does, so the widget
+/// must fetch again immediately and render data - not the red "COULDN'T FETCH"
+/// screen - without a restart and without waiting for the next `:00`/`:30`.
 #[test]
 fn widget_e2e_tray_refresh_recovers() {
     use std::io::{Read, Write};
@@ -1496,6 +1497,15 @@ fn widget_e2e_tray_refresh_recovers() {
         "airqlality-e2e-refresh-{}.json",
         std::process::id()
     ));
+    // Isolate persistence: EXP24 made real keys a normal thing to have in
+    // `%APPDATA%`, and those extra sources would join this loopback stack and
+    // fail it. An empty APPDATA means Open-Meteo alone, as the seam expects.
+    let appdata = std::env::temp_dir().join(format!(
+        "airqlality-e2e-refresh-appdata-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&appdata);
+    std::fs::create_dir_all(&appdata).expect("create temp APPDATA");
     for path in [&png, &fetch_dump, &tray_dump] {
         let _ = std::fs::remove_file(path);
     }
@@ -1555,6 +1565,9 @@ fn widget_e2e_tray_refresh_recovers() {
         .env("AIRQLALITY_REFRESH_PERIOD_SECS", "7200")
         .env("AIRQLALITY_FETCH_DUMP", &fetch_dump)
         .env("AIRQLALITY_TRAY_DUMP", &tray_dump)
+        .env("APPDATA", &appdata)
+        .env_remove("AIRQLALITY_OPENAQ_KEY")
+        .env_remove("AIRQLALITY_OWM_KEY")
         .output()
         .expect("failed to spawn capture.ps1");
 
@@ -1623,4 +1636,319 @@ fn widget_e2e_tray_refresh_recovers() {
     let _ = std::fs::remove_file(&png);
     let _ = std::fs::remove_file(&fetch_dump);
     let _ = std::fs::remove_file(&tray_dump);
+    let _ = std::fs::remove_dir_all(&appdata);
+}
+
+/// EXP24: opening the key prompt must draw the first step over the widget (a
+/// 404 px PANEL dialog) and must not write anything by merely opening it. The
+/// seam stands in for the tray's "API keys..." item, which a posted key cannot
+/// click.
+#[test]
+fn widget_e2e_keys_prompt_asks_for_openaq() {
+    let _guard = window_guard();
+    let exe = env!("CARGO_BIN_EXE_airqlality");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("capture.ps1");
+    // Isolate persistence from the developer's real %APPDATA%.
+    let appdata = std::env::temp_dir().join(format!("airqlality-keys-1-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&appdata);
+    std::fs::create_dir_all(&appdata).expect("create temp APPDATA");
+    let png = std::env::temp_dir().join(format!("airqlality-e2e-keys-1-{}.png", std::process::id()));
+    let _ = std::fs::remove_file(&png);
+
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&script)
+        .arg("-Exe")
+        .arg(exe)
+        .arg("-Out")
+        .arg(&png)
+        .arg("-WaitSeconds")
+        .arg("7")
+        .env("AIRQLALITY_SOURCE", "mock")
+        .env("AIRQLALITY_FREEZE_NOW", "1")
+        .env("AIRQLALITY_KEYS_PROMPT", "1")
+        .env("APPDATA", &appdata)
+        .env_remove("AIRQLALITY_OPENAQ_KEY")
+        .env_remove("AIRQLALITY_OWM_KEY")
+        .output()
+        .expect("failed to spawn capture.ps1");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let log = format!("--- capture stdout ---\n{stdout}\n--- capture stderr ---\n{stderr}");
+    assert!(
+        !stdout.contains("PROCESS_EXITED"),
+        "app exited before it could render:\n{log}"
+    );
+    assert!(stdout.contains("SAVED"), "capture produced no screenshot:\n{log}");
+
+    let img = image::open(&png)
+        .expect("decode screenshot PNG")
+        .to_rgba8();
+    let (iw, ih) = (img.width(), img.height());
+    let mut panel = 0usize;
+    for y in 0..ih {
+        for x in 0..iw {
+            let px = img.get_pixel(x, y).0;
+            if px[3] >= 200 && [px[0], px[1], px[2]] == PANEL {
+                panel += 1;
+            }
+        }
+    }
+    eprintln!("e2e keys prompt pixels ({iw}x{ih}): panel={panel}");
+
+    assert!(
+        panel > 40_000,
+        "the key dialog was not drawn (panel={panel}):\n{log}"
+    );
+    assert!(
+        !appdata.join("AirQlality").join("config.json").exists(),
+        "opening the prompt must not write a key by itself"
+    );
+
+    let _ = std::fs::remove_file(&png);
+    let _ = std::fs::remove_dir_all(&appdata);
+}
+
+/// Count the dialog's panel pixels, the cheapest proof that a modal is on
+/// screen (the closed widget has none).
+fn panel_pixels(png: &Path) -> usize {
+    let img = image::open(png).expect("decode screenshot PNG").to_rgba8();
+    let (iw, ih) = (img.width(), img.height());
+    let mut panel = 0usize;
+    for y in 0..ih {
+        for x in 0..iw {
+            let px = img.get_pixel(x, y).0;
+            if px[3] >= 200 && [px[0], px[1], px[2]] == PANEL {
+                panel += 1;
+            }
+        }
+    }
+    panel
+}
+
+fn keys_dump(path: &Path, log: &str) -> String {
+    std::fs::read_to_string(path).unwrap_or_else(|e| panic!("no keys dump ({e}):\n{log}"))
+}
+
+/// EXP24: typing a key and pressing Enter records it and **stays** on that
+/// step - navigation is its own pair of buttons now. The screenshot shows the
+/// dialog still open with the saved note; the file is the proof of the save.
+#[test]
+fn widget_e2e_keys_prompt_saves_and_stays() {
+    let _guard = window_guard();
+    let exe = env!("CARGO_BIN_EXE_airqlality");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("capture.ps1");
+    let appdata = std::env::temp_dir().join(format!("airqlality-keys-2-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&appdata);
+    std::fs::create_dir_all(&appdata).expect("create temp APPDATA");
+    let png = std::env::temp_dir().join(format!("airqlality-e2e-keys-2-{}.png", std::process::id()));
+    let dump = std::env::temp_dir().join(format!("airqlality-e2e-keys-2-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&png);
+    let _ = std::fs::remove_file(&dump);
+    let key = "0123456789abcdef0123456789abcdef";
+
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&script)
+        .arg("-Exe")
+        .arg(exe)
+        .arg("-Out")
+        .arg(&png)
+        .arg("-WaitSeconds")
+        .arg("7")
+        .arg("-Type")
+        .arg(key)
+        .arg("-Press")
+        .arg("enter")
+        .env("AIRQLALITY_SOURCE", "mock")
+        .env("AIRQLALITY_FREEZE_NOW", "1")
+        .env("AIRQLALITY_KEYS_PROMPT", "1")
+        .env("AIRQLALITY_KEYS_DUMP", &dump)
+        .env("APPDATA", &appdata)
+        .env_remove("AIRQLALITY_OPENAQ_KEY")
+        .env_remove("AIRQLALITY_OWM_KEY")
+        .output()
+        .expect("failed to spawn capture.ps1");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let log = format!("--- capture stdout ---\n{stdout}\n--- capture stderr ---\n{stderr}");
+    assert!(
+        !stdout.contains("PROCESS_EXITED"),
+        "app exited before it could render:\n{log}"
+    );
+    assert!(stdout.contains("SAVED"), "capture produced no screenshot:\n{log}");
+
+    let config = appdata.join("AirQlality").join("config.json");
+    let saved = std::fs::read_to_string(&config).unwrap_or_else(|e| {
+        panic!("the Enter never saved a key ({e}):\n{log}");
+    });
+    eprintln!("e2e keys prompt saved: {saved}");
+    assert!(
+        saved.contains(&format!("\"openaq_key\":\"{key}\"")),
+        "the typed OpenAQ key is not in the config:\n{saved}\n{log}"
+    );
+    assert!(
+        !saved.contains("owm_key"),
+        "saving one key must not touch the other slot:\n{saved}"
+    );
+
+    let state = keys_dump(&dump, &log);
+    eprintln!("e2e keys state: {state}");
+    assert!(
+        state.contains("\"step\":1") && state.contains("\"saved\":[\"openaq\"]"),
+        "save should stay on step 1 with OpenAQ stored:\n{state}\n{log}"
+    );
+
+    let panel = panel_pixels(&png);
+    eprintln!("e2e keys saved pixels: panel={panel}");
+    assert!(
+        panel > 40_000,
+        "the dialog closed on Save (panel={panel}):\n{log}"
+    );
+
+    let _ = std::fs::remove_file(&png);
+    let _ = std::fs::remove_file(&dump);
+    let _ = std::fs::remove_dir_all(&appdata);
+}
+
+/// EXP24: Next is its own button - Tab off the field, Enter on Next - and it
+/// must move to OpenWeatherMap without saving anything.
+#[test]
+fn widget_e2e_keys_prompt_navigates_to_owm() {
+    let _guard = window_guard();
+    let exe = env!("CARGO_BIN_EXE_airqlality");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("capture.ps1");
+    let appdata = std::env::temp_dir().join(format!("airqlality-keys-nav-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&appdata);
+    std::fs::create_dir_all(&appdata).expect("create temp APPDATA");
+    let png = std::env::temp_dir().join(format!("airqlality-e2e-keys-nav-{}.png", std::process::id()));
+    let dump = std::env::temp_dir().join(format!("airqlality-e2e-keys-nav-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&png);
+    let _ = std::fs::remove_file(&dump);
+
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&script)
+        .arg("-Exe")
+        .arg(exe)
+        .arg("-Out")
+        .arg(&png)
+        .arg("-WaitSeconds")
+        .arg("7")
+        // Field -> Next (Prev is disabled on step 1), Enter activates Next.
+        .arg("-Press")
+        .arg("tab enter")
+        .env("AIRQLALITY_SOURCE", "mock")
+        .env("AIRQLALITY_FREEZE_NOW", "1")
+        .env("AIRQLALITY_KEYS_PROMPT", "1")
+        .env("AIRQLALITY_KEYS_DUMP", &dump)
+        .env("APPDATA", &appdata)
+        .env_remove("AIRQLALITY_OPENAQ_KEY")
+        .env_remove("AIRQLALITY_OWM_KEY")
+        .output()
+        .expect("failed to spawn capture.ps1");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let log = format!("--- capture stdout ---\n{stdout}\n--- capture stderr ---\n{stderr}");
+    assert!(stdout.contains("SAVED"), "capture produced no screenshot:\n{log}");
+
+    let state = keys_dump(&dump, &log);
+    eprintln!("e2e keys nav state: {state}");
+    assert!(
+        state.contains("\"step\":2") && state.contains("\"saved\":[]"),
+        "Next should show OpenWeatherMap and save nothing:\n{state}\n{log}"
+    );
+    assert!(
+        !appdata.join("AirQlality").join("config.json").exists(),
+        "navigating must not write a key"
+    );
+    assert!(
+        panel_pixels(&png) > 40_000,
+        "the dialog vanished while navigating:\n{log}"
+    );
+
+    let _ = std::fs::remove_file(&png);
+    let _ = std::fs::remove_file(&dump);
+    let _ = std::fs::remove_dir_all(&appdata);
+}
+
+/// EXP24: the second prompt can be reached directly and saves into its own
+/// slot, leaving OpenAQ alone.
+#[test]
+fn widget_e2e_keys_prompt_saves_owm_directly() {
+    let _guard = window_guard();
+    let exe = env!("CARGO_BIN_EXE_airqlality");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("capture.ps1");
+    let appdata = std::env::temp_dir().join(format!("airqlality-keys-owm-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&appdata);
+    std::fs::create_dir_all(&appdata).expect("create temp APPDATA");
+    let png = std::env::temp_dir().join(format!("airqlality-e2e-keys-owm-{}.png", std::process::id()));
+    let dump = std::env::temp_dir().join(format!("airqlality-e2e-keys-owm-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&png);
+    let _ = std::fs::remove_file(&dump);
+    let key = "b17ebb2f8a94df73e3633bc4e6fda481";
+
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&script)
+        .arg("-Exe")
+        .arg(exe)
+        .arg("-Out")
+        .arg(&png)
+        .arg("-WaitSeconds")
+        .arg("7")
+        .arg("-Type")
+        .arg(key)
+        .arg("-Press")
+        .arg("enter")
+        .env("AIRQLALITY_SOURCE", "mock")
+        .env("AIRQLALITY_FREEZE_NOW", "1")
+        .env("AIRQLALITY_KEYS_PROMPT", "2")
+        .env("AIRQLALITY_KEYS_DUMP", &dump)
+        .env("APPDATA", &appdata)
+        .env_remove("AIRQLALITY_OPENAQ_KEY")
+        .env_remove("AIRQLALITY_OWM_KEY")
+        .output()
+        .expect("failed to spawn capture.ps1");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let log = format!("--- capture stdout ---\n{stdout}\n--- capture stderr ---\n{stderr}");
+    assert!(stdout.contains("SAVED"), "capture produced no screenshot:\n{log}");
+
+    let config = appdata.join("AirQlality").join("config.json");
+    let saved = std::fs::read_to_string(&config).unwrap_or_else(|e| {
+        panic!("the Enter never saved the OWM key ({e}):\n{log}");
+    });
+    eprintln!("e2e keys owm saved: {saved}");
+    assert!(
+        saved.contains(&format!("\"owm_key\":\"{key}\"")),
+        "the typed OpenWeatherMap key is not in the config:\n{saved}\n{log}"
+    );
+    assert!(
+        !saved.contains("openaq_key"),
+        "saving OpenWeatherMap must not touch OpenAQ:\n{saved}"
+    );
+
+    let state = keys_dump(&dump, &log);
+    eprintln!("e2e keys owm state: {state}");
+    assert!(
+        state.contains("\"step\":2") && state.contains("\"saved\":[\"owm\"]"),
+        "the second step should hold its own key:\n{state}\n{log}"
+    );
+
+    let _ = std::fs::remove_file(&png);
+    let _ = std::fs::remove_file(&dump);
+    let _ = std::fs::remove_dir_all(&appdata);
 }

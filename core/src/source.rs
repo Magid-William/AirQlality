@@ -10,6 +10,11 @@ pub enum SourceError {
     /// The request could not be made or did not return a success status
     /// (DNS, TLS, timeout, HTTP 4xx/5xx).
     Network(String),
+    /// The provider refused the credential (HTTP 401/403): the request itself
+    /// is fine, but the key is wrong, not activated yet, or revoked. Kept apart
+    /// from [`SourceError::Network`] so the widget can say "check the key"
+    /// instead of "network error" (EXP24).
+    Rejected(String),
     /// The response arrived but could not be understood.
     Parse(String),
 }
@@ -19,6 +24,7 @@ impl std::fmt::Display for SourceError {
         match self {
             SourceError::Unavailable(msg) => write!(f, "source unavailable: {msg}"),
             SourceError::Network(msg) => write!(f, "network error: {msg}"),
+            SourceError::Rejected(msg) => write!(f, "key rejected ({msg})"),
             SourceError::Parse(msg) => write!(f, "could not parse response: {msg}"),
         }
     }

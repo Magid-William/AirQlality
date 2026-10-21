@@ -9,9 +9,11 @@
 // runtime, so there is no console output to preserve.
 #![windows_subsystem = "windows"]
 
+mod browser;
+mod commands;
+mod keys;
 mod notify;
 mod persist;
-mod refresh;
 mod schedule;
 mod theme;
 mod ui;

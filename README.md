@@ -10,6 +10,8 @@ lives in the notification area so it is one click away instead of one more tab.
 
 ![AirQlality in Cairo: VENT verdict, PM2.5 curve with forecast, day/night wave, noise estimate](experiments/EXP21/EXP21-real-cairo.png)
 
+![AirQlality's tray icon, tinted by the verdict, sitting in the Windows notification area](assets/tray.png)
+
 ## What it does
 
 - **A verdict, not a dashboard** - `OPEN`, `VENT` or `KEEP CLOSED` for right
@@ -76,16 +78,26 @@ Nothing is bundled except the city list; the app fetches the rest.
 | [OpenAQ](https://openaq.org/) | ground-station PM2.5 near the city | free key |
 | [OpenWeatherMap Air Pollution](https://openweathermap.org/api/air-pollution) | a second model forecast | free key |
 
-Keys are optional and live **outside** the repository - in
-`%APPDATA%\AirQlality\config.json`:
+Keys are optional. Open the prompt from the tray menu's **API keys...** item, or
+press `Ctrl+Shift+K`. It asks for one source at a time - OpenAQ, then
+OpenWeatherMap - with **Prev / Next** to move between them; each step keeps what
+you typed. The **free-key address is a link** that opens your browser. **Enter**
+(or Save) stores only the current key and stays on that
+step, **Esc** (or Cancel) closes, **Remove** turns that source off. Paste with
+`Ctrl+V`; the field is masked, a too-short paste or the *other* source's key is
+refused, and the key is checked right away (`key accepted`, or
+`rejected: HTTP 401`). Saved keys apply immediately, without a restart. A
+brand-new OpenWeatherMap key can take up to two hours to activate.
+
+They live **outside** the repository, in `%APPDATA%\AirQlality\config.json`:
 
 ```json
 { "openaq_key": "...", "owm_key": "..." }
 ```
 
-or in `AIRQLALITY_OPENAQ_KEY` / `AIRQLALITY_OWM_KEY` (they win over the file).
-Without a key the source is simply absent, and the header names only the sources
-that actually produced data.
+or in `AIRQLALITY_OPENAQ_KEY` / `AIRQLALITY_OWM_KEY` (they win over the file,
+and the prompt says so when one is set). Without a key the source is simply
+absent, and the header names only the sources that actually produced data.
 
 Attribution and data licences are in [`NOTICE`](NOTICE) and
 [`core/assets/ATTRIBUTION.md`](core/assets/ATTRIBUTION.md). The noise curve is

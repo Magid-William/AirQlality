@@ -7,10 +7,11 @@
 //! refresh message, so it never blocks on the shell.
 //!
 //! The same thread owns the window lifecycle: left-click shows the widget,
-//! right-click pops up a Show/Hide + Refresh + Run at startup + Quit menu,
-//! and closing the window hides to the tray (via gpui's `on_window_should_close`)
-//! instead of quitting. The refresh item reaches the widget through
-//! [`crate::refresh`], not through a window message (EXP22).
+//! right-click pops up a Show/Hide + Refresh + API keys + Run at startup + Quit
+//! menu, and closing the window hides to the tray (via gpui's
+//! `on_window_should_close`) instead of quitting. Menu items that must act on
+//! the widget reach it through [`crate::commands`], not through a window
+//! message (EXP22, EXP24).
 //!
 //! All colour logic lives in the pure [`icon_bgra`], and the close decision in
 //! [`close_action`], so both are unit-testable without touching the OS.
@@ -41,8 +42,8 @@ use windows::Win32::UI::WindowsAndMessaging::{
     WM_NULL, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
 };
 
+use crate::commands::{self, Command};
 use crate::notify;
-use crate::refresh;
 use crate::startup;
 use crate::theme;
 
@@ -61,6 +62,7 @@ const MENU_TOGGLE: u32 = 1;
 const MENU_QUIT: u32 = 2;
 const MENU_STARTUP: u32 = 3;
 const MENU_REFRESH: u32 = 4;
+const MENU_KEYS: u32 = 5;
 
 /// The hidden tray window's handle (0 until the tray thread has created it).
 static TRAY_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -250,10 +252,10 @@ pub fn startup_menu_flags(registered: bool) -> MENU_ITEM_FLAGS {
     }
 }
 
-/// The flags for the "Refresh" item (EXP22): greyed when no widget is
-/// listening, i.e. under the mock seams or before the real fetch loop exists.
-/// An enabled item that does nothing would be a lie.
-pub fn refresh_menu_flags(available: bool) -> MENU_ITEM_FLAGS {
+/// The flags for a menu item that reaches the widget (Refresh, EXP22; API
+/// keys, EXP24): greyed when no widget is listening. An enabled item that does
+/// nothing would be a lie.
+pub fn menu_item_flags(available: bool) -> MENU_ITEM_FLAGS {
     if available {
         MF_STRING
     } else {
@@ -329,8 +331,8 @@ unsafe fn toggle_main() {
     }
 }
 
-/// Pop up the tray context menu (Show/Hide, Refresh, Run at startup, Quit)
-/// at the cursor.
+/// Pop up the tray context menu (Show/Hide, Refresh, API keys, Run at startup,
+/// Quit) at the cursor.
 unsafe fn show_menu(hwnd: HWND) {
     let Ok(menu) = CreatePopupMenu() else {
         return;
@@ -339,15 +341,24 @@ unsafe fn show_menu(hwnd: HWND) {
     let visible = main != 0 && IsWindowVisible(HWND(main as *mut c_void)).as_bool();
     let toggle = wide(toggle_label(visible));
     let refresh_label = wide("Refresh");
+    let keys_label = wide("API keys...");
     let startup_label = wide("Run at startup");
     let quit = wide("Quit");
     let _ = AppendMenuW(menu, MF_STRING, MENU_TOGGLE as usize, PCWSTR(toggle.as_ptr()));
     // Greyed unless the widget published its request channel (EXP22).
     let _ = AppendMenuW(
         menu,
-        refresh_menu_flags(refresh::available()),
+        menu_item_flags(commands::available(Command::Refresh)),
         MENU_REFRESH as usize,
         PCWSTR(refresh_label.as_ptr()),
+    );
+    // Always available: unlike Refresh, the prompts have something to do in
+    // every mode, including the mock seams (EXP24).
+    let _ = AppendMenuW(
+        menu,
+        menu_item_flags(commands::available(Command::ApiKeys)),
+        MENU_KEYS as usize,
+        PCWSTR(keys_label.as_ptr()),
     );
     // A native checkmark shows whether we are registered for login startup.
     let _ = AppendMenuW(
@@ -379,7 +390,13 @@ unsafe fn show_menu(hwnd: HWND) {
     match cmd as u32 {
         MENU_TOGGLE => toggle_main(),
         MENU_REFRESH => {
-            refresh::request();
+            commands::request(Command::Refresh);
+        }
+        MENU_KEYS => {
+            // The prompts live in the widget, so the menu item must make the
+            // widget visible first, then ask it to open step 1 (EXP24).
+            show_main();
+            commands::request(Command::ApiKeys);
         }
         MENU_STARTUP => {
             startup::toggle();
@@ -420,7 +437,7 @@ fn maybe_spawn_refresh_seam() {
         .name("airqlality-tray-refresh-seam".into())
         .spawn(move || {
             thread::sleep(std::time::Duration::from_millis(ms));
-            refresh::request();
+            commands::request(Command::Refresh);
         });
 }
 
@@ -734,10 +751,10 @@ mod tests {
     #[test]
     fn refresh_item_is_greyed_only_without_a_listener() {
         use windows::Win32::UI::WindowsAndMessaging::MF_STRING;
-        assert!(refresh_menu_flags(true).contains(MF_STRING));
-        assert!(!refresh_menu_flags(true).contains(MF_GRAYED));
-        assert!(refresh_menu_flags(false).contains(MF_STRING));
-        assert!(refresh_menu_flags(false).contains(MF_GRAYED));
+        assert!(menu_item_flags(true).contains(MF_STRING));
+        assert!(!menu_item_flags(true).contains(MF_GRAYED));
+        assert!(menu_item_flags(false).contains(MF_STRING));
+        assert!(menu_item_flags(false).contains(MF_GRAYED));
     }
 
     #[test]

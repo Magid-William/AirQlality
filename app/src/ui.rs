@@ -14,13 +14,16 @@ use airqlality_core::{
 use gpui::{
     AnyElement, Bounds, Context, FocusHandle, FontWeight, InteractiveElement, KeyDownEvent,
     MouseButton, MouseMoveEvent, PathBuilder, Pixels, Point, Render, Role, ScrollStrategy, Task,
-    UniformListScrollHandle, Window, canvas, deferred, div, fill, point, prelude::*, px, rgb, size,
-    uniform_list,
+    UniformListScrollHandle, Window, canvas, deferred, div, fill, point, prelude::*, px, rgb,
+    rgba, size, uniform_list,
 };
 use std::cell::Cell;
 use std::rc::Rc;
 use std::time::Duration;
 
+use crate::browser;
+use crate::commands::{self, Command};
+use crate::keys::{self, Step};
 use crate::persist;
 use crate::schedule::until_next_boundary;
 use crate::theme::*;
@@ -221,6 +224,8 @@ pub struct Widget {
     results_scroll: UniformListScrollHandle,
     /// Focus target for the location trigger (a tab stop; EXP10).
     trigger_focus: FocusHandle,
+    /// Focus target for the header's "API keys" button (EXP24).
+    keys_focus: FocusHandle,
     /// Focus target for the search field, so keystrokes reach `on_search_key`.
     search_focus: FocusHandle,
     /// Whether we have focused the search field for the current open state.
@@ -253,6 +258,24 @@ pub struct Widget {
     /// something focused so key events reach the root handler (with nothing
     /// focused, the dispatch path is just the window root).
     initial_focus_done: bool,
+    /// The open API-key prompt, if any (EXP24). Two steps: OpenAQ, then
+    /// OpenWeatherMap, navigable in both directions with their own buttons.
+    prompt: Option<keys::Prompt>,
+    /// Which prompt control the keyboard is on: `None` is the text field,
+    /// `Some(0)` Prev, `Some(1)` Next, `Some(2)` Remove, `Some(3)` Cancel,
+    /// `Some(4)` Save. Buttons are reached with Tab; Enter activates them.
+    prompt_action: Option<usize>,
+    /// Per-step sequence numbers so a key check that finishes late cannot
+    /// overwrite the note of a newer save on the same step.
+    key_check_seq: [u64; 2],
+    /// The keys currently in the config file (no environment override), so the
+    /// prompt can say what is stored and offer Remove.
+    file_keys: persist::Keys,
+    /// Focus target for the prompt's key field.
+    prompt_focus: FocusHandle,
+    /// Whether the prompt's field has been focused for the current open state
+    /// (focus is set on the next frame, which needs the window).
+    prompt_focused: bool,
 }
 
 impl Widget {
@@ -279,7 +302,8 @@ impl Widget {
             // `tab_stop(true)` is what makes `focus_next` reach these; `tab_index`
             // fixes the order (trigger before the search field).
             trigger_focus: cx.focus_handle().tab_stop(true).tab_index(0),
-            search_focus: cx.focus_handle().tab_stop(true).tab_index(1),
+            keys_focus: cx.focus_handle().tab_stop(true).tab_index(1),
+            search_focus: cx.focus_handle().tab_stop(true).tab_index(2),
             search_focused: false,
             active: 0,
             caret_on: true,
@@ -291,7 +315,29 @@ impl Widget {
             night: night_enabled(),
             a11y_dumped: false,
             initial_focus_done: false,
+            prompt: None,
+            prompt_action: None,
+            key_check_seq: [0, 0],
+            file_keys: persist::load_file_keys(),
+            prompt_focus: cx.focus_handle(),
+            prompt_focused: false,
         };
+
+        // Test/demo seam (EXP24): open a key prompt at launch, at step 1 or 2,
+        // so the windowed E2E can screenshot each prompt without a tray click.
+        if let Ok(which) = std::env::var("AIRQLALITY_KEYS_PROMPT") {
+            let step = match which.trim() {
+                "2" | "owm" | "openweathermap" => Step::Owm,
+                _ => Step::Openaq,
+            };
+            widget.prompt = Some(keys::Prompt::at(step));
+            widget.dump_prompt();
+        }
+
+        // The tray menu can reach the widget in every mode (EXP24): Refresh is
+        // only enabled when there is a real fetch to re-run, the key prompts
+        // always.
+        widget.start_command_requests(cx);
 
         if use_mock() {
             if use_mock_stack() {
@@ -332,10 +378,8 @@ impl Widget {
                 }
             }
         } else {
-            // Real mode only: listen for the tray's "Refresh" (EXP22) and
-            // start the fetch loop. The mocks have no fetch to re-run, so they
-            // publish nothing and the menu item stays greyed.
-            widget.start_refresh_requests(cx);
+            // Real mode: start the fetch loop. The mocks have no fetch to
+            // re-run, so the tray's Refresh item stays greyed there.
             widget.spawn_real(cx);
         }
 
@@ -450,22 +494,348 @@ impl Widget {
         true
     }
 
-    /// Publish the tray's refresh channel and await it in one idle task (EXP22).
-    /// Not a timer: the task costs nothing until the menu item sends a request,
-    /// and `bounded(1)` means a burst of clicks collapses into one refresh.
-    fn start_refresh_requests(&mut self, cx: &mut Context<Self>) {
-        let (sender, receiver) = crate::refresh::channel();
-        crate::refresh::publish(sender);
+    /// Publish the tray's command channel and await it in one idle task (EXP22,
+    /// EXP24). Not a timer: the task costs nothing until a menu item sends a
+    /// request. Refresh is enabled only when there is a real fetch to re-run;
+    /// the key prompts are always available.
+    fn start_command_requests(&mut self, cx: &mut Context<Self>) {
+        let (sender, receiver) = commands::channel();
+        commands::publish(sender, !use_mock());
         cx.spawn(async move |this, cx| loop {
-            if receiver.recv().await.is_err() {
+            let Ok(command) = receiver.recv().await else {
                 break; // every sender is gone: nothing can ask again
-            }
-            let alive = this.update(cx, |widget, cx| widget.refresh_now(cx));
+            };
+            commands::done(command);
+            let alive = this.update(cx, |widget, cx| match command {
+                Command::Refresh => {
+                    if use_mock() {
+                        cx.notify(); // no fetch to re-run; the item is greyed
+                    } else {
+                        widget.refresh_now(cx);
+                    }
+                }
+                Command::ApiKeys => widget.open_keys(Step::Openaq, cx),
+            });
             if alive.is_err() {
                 break; // the window closed
             }
         })
         .detach();
+    }
+
+    /// Open the key prompts at `step` without touching a window: focus and the
+    /// caret are put in place on the next frame, like the location panel's
+    /// startup seam. Closes the location panel first, since both own the same
+    /// overlay space and the same caret.
+    fn open_keys(&mut self, step: Step, cx: &mut Context<Self>) {
+        self.dropdown_open = false;
+        self.search_focused = false;
+        self.file_keys = persist::load_file_keys();
+        self.prompt = Some(keys::Prompt::at(step));
+        self.prompt_action = None;
+        self.prompt_focused = false;
+        self.dump_prompt();
+        cx.notify();
+    }
+
+    /// Close the prompts. `apply` refetches (real mode only), so keys saved in
+    /// either step take effect immediately, without a restart.
+    fn close_keys(&mut self, apply: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.prompt = None;
+        self.prompt_action = None;
+        self.prompt_focused = false;
+        self.caret_on = true;
+        self.blink_task = None;
+        window.focus(&self.trigger_focus, cx);
+        if apply && !use_mock() {
+            self.refresh_now(cx);
+        } else {
+            cx.notify();
+        }
+    }
+
+    /// The stored (file) key for `step`, if any.
+    fn file_key(&self, step: Step) -> Option<&str> {
+        match step {
+            Step::Openaq => self.file_keys.openaq.as_deref(),
+            Step::Owm => self.file_keys.owm.as_deref(),
+        }
+    }
+
+    /// Test seam (EXP24): after every prompt state change, write which step is
+    /// showing and which sources have a stored key, so the windowed E2E can
+    /// prove navigation and saving without reading pixels as text.
+    fn dump_prompt(&self) {
+        let Ok(path) = std::env::var("AIRQLALITY_KEYS_DUMP") else {
+            return;
+        };
+        let Some(prompt) = self.prompt.as_ref() else {
+            return;
+        };
+        let saved: Vec<&str> = [
+            ("openaq", self.file_keys.openaq.is_some()),
+            ("owm", self.file_keys.owm.is_some()),
+        ]
+        .into_iter()
+        .filter(|(_, on)| *on)
+        .map(|(name, _)| name)
+        .collect();
+        let saved = saved
+            .iter()
+            .map(|name| format!("\"{name}\""))
+            .collect::<Vec<_>>()
+            .join(",");
+        let json = format!(
+            "{{\"step\":{},\"saved\":[{saved}]}}",
+            prompt.step().position()
+        );
+        let _ = std::fs::write(path, json);
+    }
+
+    /// Save the current step (Enter / Save). It stays on this step: navigating
+    /// is its own pair of buttons, so saving one key never pushes the user into
+    /// the other. An empty field changes nothing; a partial paste, or the other
+    /// source's key, is refused with a reason.
+    fn save_prompt(&mut self, cx: &mut Context<Self>) {
+        let Some(prompt) = self.prompt.as_ref() else {
+            return;
+        };
+        let step = prompt.step();
+        let value = match prompt.validate() {
+            Ok(value) => value,
+            Err(reason) => {
+                if let Some(prompt) = self.prompt.as_mut() {
+                    prompt.set_note(keys::Note::warning(reason));
+                }
+                self.dump_prompt();
+                cx.notify();
+                return;
+            }
+        };
+        let Some(key) = value else {
+            if let Some(prompt) = self.prompt.as_mut() {
+                prompt.set_note(keys::Note::info(
+                    "nothing entered \u{2014} the stored key is unchanged",
+                ));
+            }
+            self.dump_prompt();
+            cx.notify();
+            return;
+        };
+
+        // The other slot's key: the mistake that sent the OpenAQ key to
+        // OpenWeatherMap and produced a 401 an hour later (EXP24 report).
+        let (other, other_title) = match step {
+            Step::Openaq => (self.file_keys.owm.clone(), Step::Owm.title()),
+            Step::Owm => (self.file_keys.openaq.clone(), Step::Openaq.title()),
+        };
+        if keys::duplicate_of(&key, other.as_deref()) {
+            let text = format!("{other_title} already holds this key \u{2014} each source needs its own");
+            if let Some(prompt) = self.prompt.as_mut() {
+                prompt.set_note(keys::Note::warning(&text));
+            }
+            self.dump_prompt();
+            cx.notify();
+            return;
+        }
+
+        let mut keys = self.file_keys.clone();
+        match step {
+            Step::Openaq => keys.openaq = Some(key.clone()),
+            Step::Owm => keys.owm = Some(key.clone()),
+        }
+        persist::save_keys(&keys);
+        self.file_keys = keys;
+        self.prompt_action = None;
+        if let Some(prompt) = self.prompt.as_mut() {
+            prompt.clear();
+            prompt.set_note(if use_mock() {
+                keys::Note::saved(&keys::tail(&key))
+            } else {
+                keys::Note::checking()
+            });
+        }
+        if !use_mock() {
+            self.start_key_check(step, &key, cx);
+        }
+        self.dump_prompt();
+        cx.notify();
+    }
+
+    /// One cheap request with the just-saved key, on the background executor.
+    /// The result lands on *that* step's note, even if the user has navigated
+    /// away; a newer save invalidates it through the per-step sequence number.
+    fn start_key_check(&mut self, step: Step, key: &str, cx: &mut Context<Self>) {
+        let location = self.selected.clone();
+        let key = key.to_string();
+        self.key_check_seq[step.index()] += 1;
+        let seq = self.key_check_seq[step.index()];
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    match step {
+                        Step::Openaq => OpenAqSource::for_location(&location, &key)
+                            .and_then(|source| source.check_key()),
+                        Step::Owm => OpenWeatherMapSource::for_location(&location, &key)
+                            .and_then(|source| source.check_key()),
+                    }
+                })
+                .await;
+            let _ = this.update(cx, |widget, cx| {
+                if widget.key_check_seq[step.index()] != seq {
+                    return; // a newer save for this step owns the note
+                }
+                let note = match result {
+                    Ok(()) => keys::Note::accepted(),
+                    Err(SourceError::Rejected(status)) => keys::Note::rejected(&status),
+                    Err(error) => keys::Note::warning(&format!("could not check: {error}")),
+                };
+                if let Some(prompt) = widget.prompt.as_mut() {
+                    prompt.set_note_at(step, note);
+                }
+                widget.dump_prompt();
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Delete the stored key for the current step (Remove). Stays on the step.
+    fn remove_prompt_key(&mut self, cx: &mut Context<Self>) {
+        let Some(step) = self.prompt.as_ref().map(|p| p.step()) else {
+            return;
+        };
+        let mut keys = self.file_keys.clone();
+        match step {
+            Step::Openaq => keys.openaq = None,
+            Step::Owm => keys.owm = None,
+        }
+        persist::save_keys(&keys);
+        self.file_keys = keys;
+        self.key_check_seq[step.index()] += 1; // cancel any check in flight
+        self.prompt_action = None;
+        if let Some(prompt) = self.prompt.as_mut() {
+            prompt.clear();
+            prompt.set_note(keys::Note::info(
+                "removed \u{2014} this source is off until a key is saved",
+            ));
+        }
+        self.dump_prompt();
+        cx.notify();
+    }
+
+    /// Switch the prompt between steps. Never saves and never clears: each step
+    /// keeps its own field.
+    fn nav_prompt(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let Some(prompt) = self.prompt.as_mut() else {
+            return;
+        };
+        let moved = if forward { prompt.next() } else { prompt.prev() };
+        if !moved {
+            return;
+        }
+        self.prompt_action = None;
+        self.dump_prompt();
+        cx.notify();
+    }
+
+    /// Keys that belong to the prompt. Tab cycles the field and the enabled
+    /// buttons; typing only reaches the field.
+    fn on_prompt_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(prompt) = self.prompt.as_ref() else {
+            return;
+        };
+        let step = prompt.step();
+        let can_prev = prompt.can_prev();
+        let can_next = prompt.can_next();
+        let ctrl = ev.keystroke.modifiers.control || ev.keystroke.modifiers.platform;
+        let action = self.prompt_action;
+        let has_key = self.file_key(step).is_some();
+        match ev.keystroke.key.as_str() {
+            "tab" => {
+                self.prompt_action = keys::next_action(action, can_prev, can_next, has_key);
+                cx.stop_propagation();
+                cx.notify();
+            }
+            "escape" => {
+                self.close_keys(true, window, cx);
+                cx.stop_propagation();
+            }
+            // Ctrl+Left / Ctrl+Right: the same Prev/Next the buttons offer.
+            "left" if ctrl => {
+                self.nav_prompt(false, cx);
+                cx.stop_propagation();
+            }
+            "right" if ctrl => {
+                self.nav_prompt(true, cx);
+                cx.stop_propagation();
+            }
+            "enter" | "space" if action.is_some() => {
+                self.activate_prompt_action(window, cx);
+                cx.stop_propagation();
+            }
+            "enter" => {
+                self.save_prompt(cx);
+                cx.stop_propagation();
+            }
+            "backspace" if action.is_none() => {
+                if let Some(prompt) = self.prompt.as_mut() {
+                    prompt.backspace();
+                }
+                cx.notify();
+            }
+            // Ctrl+V, the path nearly every key takes: copy it from the
+            // provider's page. The platform hands us the whole clipboard.
+            "v" if ctrl && action.is_none() => {
+                if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+                    if let Some(prompt) = self.prompt.as_mut() {
+                        prompt.push_text(&text);
+                    }
+                }
+                cx.notify();
+            }
+            // No other chord types into a key field (Ctrl+K must not leave a
+            // stray "k" in the buffer).
+            _ if ctrl => {
+                cx.stop_propagation();
+            }
+            _ => {
+                // Typing always goes to the field, even when Tab has put the
+                // keyboard on a button: a character means "edit the key".
+                if let Some(ch) = ev.keystroke.key_char.as_deref() {
+                    if !ch.is_empty() && !ch.chars().any(char::is_control) {
+                        self.prompt_action = None;
+                        if let Some(prompt) = self.prompt.as_mut() {
+                            prompt.push_text(ch);
+                        }
+                        cx.notify();
+                    }
+                }
+            }
+        }
+    }
+
+    /// Enter/Space on a focused prompt button.
+    fn activate_prompt_action(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        match self.prompt_action {
+            Some(0) => self.nav_prompt(false, cx),
+            Some(1) => self.nav_prompt(true, cx),
+            Some(2) => {
+                if let Some(step) = self.prompt.as_ref().map(|prompt| prompt.step()) {
+                    // Same rule as the mouse path: the shell call must not run
+                    // inside gpui's dispatch (it pumps messages). EXP24 crash.
+                    let url = step.url().to_string();
+                    std::thread::spawn(move || {
+                        browser::open(&url);
+                    });
+                    self.dump_prompt();
+                }
+            }
+            Some(3) => self.remove_prompt_key(cx),
+            Some(4) => self.close_keys(true, window, cx),
+            _ => self.save_prompt(cx),
+        }
     }
 
     /// Rebuild and re-fetch everything for the selected location right now: the
@@ -554,6 +924,12 @@ impl Widget {
     fn on_root_key(&mut self, ev: &KeyDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         let shift = ev.keystroke.modifiers.shift;
         let ctrl = ev.keystroke.modifiers.control || ev.keystroke.modifiers.platform;
+        // While the key prompts are open they own the keyboard: Esc, Enter, Tab
+        // and every character belong to the step, not to the widget (EXP24).
+        if self.prompt.is_some() {
+            self.on_prompt_key(ev, window, cx);
+            return;
+        }
         match ev.keystroke.key.as_str() {
             // Move the keyboard focus across the tab stops. gpui does not bind
             // Tab itself, so this is the app's job.
@@ -567,6 +943,10 @@ impl Widget {
             }
             "escape" if self.dropdown_open => {
                 self.close_panel(window, cx);
+                cx.stop_propagation();
+            }
+            "k" if ctrl && shift => {
+                self.open_keys(Step::Openaq, cx);
                 cx.stop_propagation();
             }
             "k" if ctrl => {
@@ -707,7 +1087,20 @@ impl Widget {
         let mut outages: Vec<String> = Vec::new();
         let mut all: Vec<String> = Vec::new();
         for (label, error) in failures {
-            let text = format!("{label}: {error}");
+            let text = match &error {
+                // A refused key is not an outage and will not fix itself; say
+                // what it is and where to fix it (EXP24). A brand-new
+                // OpenWeatherMap key is invalid until it activates.
+                SourceError::Rejected(status) => {
+                    let hint = if label == "OpenWeatherMap" {
+                        "check the key; a new key can take up to 2 hours to activate"
+                    } else {
+                        "check the key in the API-key prompt"
+                    };
+                    format!("{label}: key rejected ({status}) \u{2014} {hint}")
+                }
+                _ => format!("{label}: {error}"),
+            };
             if !matches!(error, SourceError::Unavailable(_)) {
                 outages.push(text.clone());
             }
@@ -841,35 +1234,77 @@ impl Widget {
                 div()
                     .flex()
                     .items_center()
-                    .gap_1()
-                    .text_color(rgb(MUTED))
-                    .cursor_pointer()
-                    // A 2px background-coloured border keeps the layout stable
-                    // while giving a thick ring when focus swaps its colour in.
-                    .border_2()
-                    .border_color(rgb(BG))
-                    .rounded_sm()
-                    .track_focus(&self.trigger_focus)
-                    .focus_visible(|s| s.border_color(rgb(FOCUS)).text_color(rgb(TEXT)))
-                    .hover(|s| s.text_color(rgb(TEXT)))
-                    .id("location-trigger")
-                    .role(Role::Button)
-                    .aria_label("Change location")
-                    .aria_expanded(self.dropdown_open)
-                    .aria_keyshortcuts("Ctrl+K")
-                    .on_click(cx.listener(|this, _ev, window, cx| this.toggle_open(window, cx)))
-                    .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
-                        // Enter / Space activate the trigger, like a button.
-                        match ev.keystroke.key.as_str() {
-                            "enter" | "space" => {
-                                this.toggle_open(window, cx);
-                                cx.stop_propagation();
-                            }
-                            _ => {}
-                        }
-                    }))
-                    .child(format!("data \u{a9} {sources}  \u{b7}  {label}"))
-                    .child(caret),
+                    .gap_2()
+                    // The keys entry point lives in the header so it is visible
+                    // without knowing the shortcut (EXP24): the tray item and
+                    // Ctrl+Shift+K are not discoverable on their own.
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .px_1()
+                            .py(px(2.0))
+                            .text_color(rgb(MUTED))
+                            .cursor_pointer()
+                            .border_2()
+                            .border_color(rgb(BG))
+                            .rounded_sm()
+                            .track_focus(&self.keys_focus)
+                            .focus_visible(|s| s.border_color(rgb(FOCUS)).text_color(rgb(TEXT)))
+                            .hover(|s| s.text_color(rgb(TEXT)))
+                            .id("api-keys")
+                            .role(Role::Button)
+                            .aria_label("API keys")
+                            .aria_keyshortcuts("Ctrl+Shift+K")
+                            .on_click(cx.listener(|this, _ev, _window, cx| {
+                                this.open_keys(Step::Openaq, cx)
+                            }))
+                            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, cx| {
+                                match ev.keystroke.key.as_str() {
+                                    "enter" | "space" => {
+                                        this.open_keys(Step::Openaq, cx);
+                                        cx.stop_propagation();
+                                    }
+                                    _ => {}
+                                }
+                            }))
+                            .child("API keys"),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_1()
+                            .text_color(rgb(MUTED))
+                            .cursor_pointer()
+                            // A 2px background-coloured border keeps the layout
+                            // stable while giving a thick ring when focus swaps
+                            // its colour in.
+                            .border_2()
+                            .border_color(rgb(BG))
+                            .rounded_sm()
+                            .track_focus(&self.trigger_focus)
+                            .focus_visible(|s| s.border_color(rgb(FOCUS)).text_color(rgb(TEXT)))
+                            .hover(|s| s.text_color(rgb(TEXT)))
+                            .id("location-trigger")
+                            .role(Role::Button)
+                            .aria_label("Change location")
+                            .aria_expanded(self.dropdown_open)
+                            .aria_keyshortcuts("Ctrl+K")
+                            .on_click(cx.listener(|this, _ev, window, cx| this.toggle_open(window, cx)))
+                            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                                // Enter / Space activate the trigger, like a button.
+                                match ev.keystroke.key.as_str() {
+                                    "enter" | "space" => {
+                                        this.toggle_open(window, cx);
+                                        cx.stop_propagation();
+                                    }
+                                    _ => {}
+                                }
+                            }))
+                            .child(format!("data \u{a9} {sources}  \u{b7}  {label}"))
+                            .child(caret),
+                    ),
             )
     }
 
@@ -1023,6 +1458,276 @@ impl Widget {
         )
     }
 
+    /// The two-step API-key prompt (EXP24): a modal over the widget, one source
+    /// per step, a masked field, its own Prev/Next row, and a separate
+    /// Remove/Cancel/Save row. Deferred and occluding like the location panel,
+    /// so it draws above the chart and eats clicks meant for what is behind it.
+    fn keys_prompt(&self, caret: bool, cx: &mut Context<Self>) -> AnyElement {
+        let Some(prompt) = self.prompt.as_ref() else {
+            return div().into_any_element();
+        };
+        let step = prompt.step();
+        let current = self.file_key(step);
+        let has_key = current.is_some();
+        let can_prev = prompt.can_prev();
+        let can_next = prompt.can_next();
+        let action = self.prompt_action;
+        let on_field = action.is_none();
+        // An environment variable cannot be changed from here, so say so rather
+        // than let a saved key silently lose to it.
+        let env_set = std::env::var(step.env_var())
+            .ok()
+            .is_some_and(|v| !v.trim().is_empty());
+
+        let display: AnyElement = if prompt.is_empty() && !caret {
+            div()
+                .text_sm()
+                .text_color(rgb(MUTED))
+                .child("paste or type the key")
+                .into_any_element()
+        } else {
+            div()
+                .flex()
+                .items_center()
+                .text_sm()
+                .text_color(rgb(TEXT))
+                .child(prompt.masked())
+                .when(caret, |d| d.child(CARET))
+                .into_any_element()
+        };
+
+        let field = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .px_2()
+            .h(px(28.0))
+            .bg(rgb(BG))
+            .border_1()
+            .border_color(rgb(if on_field { FOCUS } else { AXIS }))
+            .rounded_sm()
+            .cursor_text()
+            .track_focus(&self.prompt_focus)
+            .id("keys-field")
+            .role(Role::TextInput)
+            .aria_label(step.field_label())
+            .aria_placeholder("paste or type the key")
+            // Never the key itself, not even masked differently: the same
+            // bullets the eye sees.
+            .aria_value(prompt.masked())
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _ev, window, cx| {
+                    this.prompt_action = None;
+                    window.focus(&this.prompt_focus, cx);
+                    cx.notify();
+                }),
+            )
+            .child(display)
+            .child(
+                div()
+                    .id("keys-clear")
+                    .role(Role::Button)
+                    .aria_label("Clear what has been typed")
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(rgb(TEXT)))
+                    .on_click(cx.listener(|this, _ev, _window, cx| {
+                        if let Some(prompt) = this.prompt.as_mut() {
+                            prompt.clear();
+                        }
+                        cx.notify();
+                    }))
+                    .child("clear"),
+            );
+
+        // A note (saved / accepted / rejected) outranks the stored-key hint.
+        let hint: AnyElement = match prompt.note() {
+            Some(note) => div()
+                .text_xs()
+                .text_color(rgb(tone_color(note.tone)))
+                .child(note.text.clone())
+                .into_any_element(),
+            None => div()
+                .text_xs()
+                .text_color(rgb(MUTED))
+                .child(keys::existing_hint(current))
+                .into_any_element(),
+        };
+
+        // Navigation is its own row, above the field: it moves between the two
+        // sources and never saves, so nobody has to walk OpenAQ -> OWM to reach
+        // the key they came to change.
+        let nav = div()
+            .flex()
+            .items_center()
+            .gap_1()
+            .child(nav_button(
+                "\u{2039} Prev",
+                can_prev,
+                action == Some(0),
+                cx.listener(|this, _ev, _window, cx| this.nav_prompt(false, cx)),
+            ))
+            .child(nav_button(
+                "Next \u{203a}",
+                can_next,
+                action == Some(1),
+                cx.listener(|this, _ev, _window, cx| this.nav_prompt(true, cx)),
+            ));
+
+        let mut buttons = div().flex().items_center().gap_1();
+        if has_key {
+            buttons = buttons.child(prompt_button(
+                "Remove",
+                false,
+                action == Some(3),
+                cx.listener(|this, _ev, _window, cx| this.remove_prompt_key(cx)),
+            ));
+        }
+        buttons = buttons
+            .child(prompt_button(
+                "Cancel",
+                false,
+                action == Some(4),
+                cx.listener(|this, _ev, window, cx| this.close_keys(true, window, cx)),
+            ))
+            .child(prompt_button(
+                "Save",
+                true,
+                action == Some(5),
+                cx.listener(|this, _ev, _window, cx| this.save_prompt(cx)),
+            ));
+
+        deferred(
+            div()
+                .absolute()
+                .inset_0()
+                .child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .occlude()
+                        // Dim the widget so the dialog reads as a modal, not a
+                        // panel laid over the chart.
+                        .bg(rgba(0x000000b0))
+                        .id("keys-backdrop")
+                        .on_click(cx.listener(|this, _ev, window, cx| {
+                            this.close_keys(true, window, cx)
+                        })),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            div()
+                                .id("keys-dialog")
+                                .role(Role::Dialog)
+                                .aria_label("API keys")
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .w(px(404.0))
+                                .p_4()
+                                .bg(rgb(PANEL))
+                                .border_1()
+                                .border_color(rgb(AXIS))
+                                .rounded_md()
+                                .occlude()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(MUTED))
+                                                .child(prompt.label()),
+                                        )
+                                        .child(nav),
+                                )
+                                .child(
+                                    div()
+                                        .text_lg()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(step.title()),
+                                )
+                                .child(
+                                    div()
+                                        .text_sm()
+                                        .text_color(rgb(MUTED))
+                                        .child(step.what()),
+                                )
+                                .child(
+                                    div()
+                                        .id("keys-link")
+                                        .role(Role::Link)
+                                        .aria_label(format!(
+                                            "Open {} in the default browser",
+                                            step.url()
+                                        ))
+                                        .self_start()
+                                        .px_1()
+                                        .py(px(1.0))
+                                        .rounded_sm()
+                                        .text_sm()
+                                        .text_color(rgb(FOCUS))
+                                        .underline()
+                                        .cursor_pointer()
+                                        .when(action == Some(2), |d| {
+                                            d.bg(rgb(PANEL_ACTIVE)).text_color(rgb(TEXT))
+                                        })
+                                        .hover(|s| s.text_color(rgb(TEXT)))
+                                        .on_click(move |_ev, _window, _cx| {
+                                            // Never call the shell on the UI
+                                            // thread: `ShellExecuteW` pumps
+                                            // messages, and re-entering gpui
+                                            // while it is dispatching a click
+                                            // panics ("RefCell already
+                                            // borrowed"). One short thread.
+                                            let url = step.url().to_string();
+                                            std::thread::spawn(move || {
+                                                browser::open(&url);
+                                            });
+                                        })
+                                        .child(step.where_to_get()),
+                                )
+                                .child(field)
+                                .child(hint)
+                                .children(env_set.then(|| {
+                                    div()
+                                        .text_xs()
+                                        .text_color(rgb(VENT))
+                                        .child(format!(
+                                            "{} is set \u{2014} it wins over this file",
+                                            step.env_var()
+                                        ))
+                                }))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .mt_2()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(MUTED))
+                                                .child("Enter saves \u{b7} Esc closes"),
+                                        )
+                                        .child(buttons),
+                                ),
+                        ),
+                ),
+        )
+        .into_any_element()
+    }
+
     fn footer(show_noise: bool, show_night: bool) -> impl IntoElement {
         let mut legend = div()
             .flex()
@@ -1072,6 +1777,77 @@ fn hint_row(text: &str) -> impl IntoElement {
         .text_sm()
         .text_color(rgb(MUTED))
         .child(text.to_string())
+}
+
+/// The colour a prompt note is drawn in.
+fn tone_color(tone: keys::Tone) -> u32 {
+    match tone {
+        keys::Tone::Muted => MUTED,
+        keys::Tone::Good => OPEN,
+        keys::Tone::Warn => VENT,
+    }
+}
+
+/// A Prev/Next button: same shape as the action buttons but greyed and inert at
+/// the ends of the list, so the row reads as navigation rather than an action.
+fn nav_button(
+    label: &'static str,
+    enabled: bool,
+    selected: bool,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+) -> impl IntoElement {
+    let text = if !enabled {
+        AXIS
+    } else if selected {
+        TEXT
+    } else {
+        MUTED
+    };
+    div()
+        .id(label)
+        .role(Role::Button)
+        .aria_label(label)
+        .px_2()
+        .py_1()
+        .text_xs()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(if selected && enabled { FOCUS } else { AXIS }))
+        .text_color(rgb(text))
+        .when(enabled, |d| {
+            d.cursor_pointer()
+                .hover(|s| s.bg(rgb(PANEL_HOVER)).text_color(rgb(TEXT)))
+                .on_click(on_click)
+        })
+        .child(label)
+}
+
+/// A button in the key prompt (EXP24): clickable, announced as a button, and
+/// highlighted while the Tab cycle is on it. `primary` marks the default action
+/// (Save) even when it does not hold keyboard focus.
+fn prompt_button(
+    label: &'static str,
+    primary: bool,
+    selected: bool,
+    on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
+) -> impl IntoElement {
+    let border = if primary || selected { FOCUS } else { AXIS };
+    div()
+        .id(label)
+        .role(Role::Button)
+        .aria_label(label)
+        .px_2()
+        .py_1()
+        .text_xs()
+        .rounded_sm()
+        .border_1()
+        .border_color(rgb(border))
+        .text_color(rgb(if primary || selected { TEXT } else { MUTED }))
+        .cursor_pointer()
+        .when(selected, |d| d.bg(rgb(PANEL_ACTIVE)))
+        .hover(|s| s.bg(rgb(PANEL_HOVER)).text_color(rgb(TEXT)))
+        .on_click(on_click)
+        .child(label)
 }
 
 fn legend_item(color: u32, label: &'static str) -> impl IntoElement {
@@ -1167,8 +1943,21 @@ impl Render for Widget {
             self.start_blink(cx);
         }
 
+        // The key prompt can be opened by the tray or the test seam, with no
+        // window in hand, so it focuses its field here, on the next frame.
+        if self.prompt.is_some() && !self.prompt_focused {
+            self.prompt_focused = true;
+            window.focus(&self.prompt_focus, cx);
+            if self.blink_task.is_none() {
+                self.start_blink(cx);
+            }
+        }
+
         // Whether the field actually holds focus right now (drives the caret).
         let search_focused = self.dropdown_open && self.search_focus.is_focused(window);
+        let prompt_caret = self.caret_on
+            && self.prompt_action.is_none()
+            && self.prompt_focus.is_focused(window);
 
         let mut root = div()
             .flex()
@@ -1231,6 +2020,10 @@ impl Render for Widget {
 
         if self.dropdown_open {
             root = root.child(self.dropdown(search_focused, cx));
+        }
+
+        if self.prompt.is_some() {
+            root = root.child(self.keys_prompt(prompt_caret, cx));
         }
 
         // Test seam: dump the accessibility tree once the platform has activated
@@ -1306,7 +2099,13 @@ fn render_banner(
             div()
                 .text_xs()
                 .text_color(rgb(VENT))
-                .child(format!("offline \u{2014} showing last data \u{b7} {msg}")),
+                .child(if msg.contains("key rejected") {
+                    // A refused key is not the network being down: saying
+                    // "offline" for it contradicts the rest of the line.
+                    format!("showing last data \u{b7} {msg}")
+                } else {
+                    format!("offline \u{2014} showing last data \u{b7} {msg}")
+                }),
         );
     }
 
