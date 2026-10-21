@@ -1,3 +1,5 @@
+<img src="assets/icon.png" alt="AirQlality icon" width="72" align="left" />
+
 # AirQlality
 
 A small Windows widget that answers one question well: **is it safe to open the

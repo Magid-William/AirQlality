@@ -92,6 +92,9 @@ _Pending._
   expect the deletion in an earlier commit.
 - PowerShell has no heredoc: write the commit message to a file and use
   `git commit -F <file>`.
+- The app icon for the README is the **256 px frame of the EXP14 `.ico`** (BMP
+  frames, not PNG): parse the ICO directory, then `struct` + `zlib` write a
+  32-bit RGBA PNG - `System.Drawing.Icon` only ever handed back the 48 px frame.
 - Verify from a fresh clone: `git clone <url> <temp>` then
   `cargo test -p airqlality-core --offline` (64/64) proves the published tree,
   not just the local one.
