@@ -53,13 +53,15 @@ jobs:
       - name: Put MinGW on PATH
         shell: pwsh
         run: |
-          $mingw = 'C:\msys64\mingw64\bin'
-          foreach ($tool in 'gcc.exe', 'windres.exe') {
-            if (-not (Test-Path (Join-Path $mingw $tool))) {
-              throw "MinGW tool missing: $mingw\$tool - the runner image changed; fix the path here."
-            }
+          $candidates = 'C:\mingw64\bin', 'C:\msys64\mingw64\bin', 'C:\msys64\ucrt64\bin'
+          $mingw = $candidates | Where-Object {
+            (Test-Path (Join-Path $_ 'gcc.exe')) -and (Test-Path (Join-Path $_ 'windres.exe'))
+          } | Select-Object -First 1
+          if (-not $mingw) {
+            throw "no MinGW with gcc.exe + windres.exe in: $($candidates -join ', ')"
           }
           $mingw | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "using $mingw"
 
       - name: Install the pinned GNU toolchain
         shell: pwsh

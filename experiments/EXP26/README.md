@@ -21,9 +21,12 @@ before it can be released.
 
 ## Methodology & blast radius
 - **CI (`.github/workflows/ci.yml`).** `windows-2025`, on push to any branch and
-  on pull requests. MSYS2's MinGW is preinstalled but *not* on `PATH`; a probe
-  step puts `C:\msys64\mingw64\bin` first and fails loudly if `gcc` or `windres`
-  is missing. `rustup` then picks the channel from `rust-toolchain.toml`
+  on pull requests. The MinGW toolchain is **`C:\mingw64\bin`** (winlibs, gcc
+  15.2) - the docs' "MSYS2 has mingw" reading is wrong, `C:\msys64` ships pacman
+  and no mingw-w64 packages - and it is not on `PATH`. A probe step takes the
+  first of `C:\mingw64\bin`, `C:\msys64\mingw64\bin`, `C:\msys64\ucrt64\bin` that
+  has both `gcc.exe` and `windres.exe`, and fails with that list otherwise.
+  `rustup` then picks the channel from `rust-toolchain.toml`
   (`stable-x86_64-pc-windows-gnu`). Gates: core tests, app unit tests
   (`--bin airqlality`), `cargo build --release`. `cargo fmt --check` and clippy
   run as **reports, not gates** - the tree is hand-formatted and a `--check` diff
@@ -79,3 +82,9 @@ _Pending._
 - `objdump -p target\release\airqlality.exe | Select-String "DLL Name"` — use
   before claiming a GNU build is self-contained; it settles the runtime-DLL
   question that `capture.ps1` only guesses at.
+- On `windows-2025` the GNU toolchain is at **`C:\mingw64\bin`** (winlibs, gcc
+  15.2), not in MSYS2: `C:\msys64\mingw64\bin\gcc.exe` does not exist, `C:\msys64`
+  carries only the base MSYS2 (pacman). Put `C:\mingw64\bin` on `PATH` for `psm`
+  and `windres`.
+- `gh run view <id> --log-failed` — use to read a red step; plain `--log` mixes
+  every step's post-action output and buries the failure.
