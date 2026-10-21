@@ -106,13 +106,13 @@ jobs:
           $size = [math]::Round((Get-Item $exe).Length / 1MB, 1)
           "ok: $($imports.Count) system imports, no MinGW runtime, $size MiB"
 
-  # Manual probe: can a hosted runner run the real widget? The suite launches the
-  # window, screenshots it and asserts exact pixels, so it needs an interactive
-  # desktop and a usable D3D adapter. Expect this to be red; a green run means we
-  # can promote it to a nightly gate.
+  # Windowed suite: launches the real widget, screenshots it and asserts exact
+  # pixels. Proven on a hosted runner (29/29 in 277.81 s, EXP26), so it gates
+  # `main` and runs on request - not on every branch push or PR, where five extra
+  # minutes buy little.
   e2e:
-    name: windowed E2E (probe, manual only)
-    if: github.event_name == 'workflow_dispatch'
+    name: windowed E2E (main + manual)
+    if: github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')
     runs-on: windows-2025
     timeout-minutes: 45
     steps:

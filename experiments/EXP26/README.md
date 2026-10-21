@@ -32,9 +32,9 @@ before it can be released.
   run as **reports, not gates** - the tree is hand-formatted and a `--check` diff
   spans most of `core/` and `app/`, so adopting rustfmt is its own experiment.
   `Swatinem/rust-cache`, concurrency cancels superseded runs.
-  The windowed E2E suite is **not** a gate (250 s, needs a desktop and a GPU; a
-  software adapter could make pixel assertions flaky) - it is a separate
-  `workflow_dispatch`-only job that probes feasibility.
+  The windowed E2E suite **does** run on hosted runners: the probe run passed
+  29/29 in 277.81 s, so it gates `main` and manual dispatches, but not every
+  branch push (five extra minutes buy little there).
 - **Release (`.github/workflows/release.yml`).** On tag `v*` and on manual
   dispatch. Asserts `tag == workspace version` (parsed from `Cargo.toml`), reruns
   the same tests, builds **`--profile dist`**, stages
@@ -107,6 +107,8 @@ _Pending._
   15.2), not in MSYS2: `C:\msys64\mingw64\bin\gcc.exe` does not exist, `C:\msys64`
   carries only the base MSYS2 (pacman). Put `C:\mingw64\bin` on `PATH` for `psm`
   and `windres`.
+- The windowed E2E suite runs fine on a hosted `windows-2025` runner (29/29,
+  277.81 s), desktop and D3D adapter included - no need for a self-hosted runner.
 - `gh run view <id> --log-failed` — use to read a red step; plain `--log` mixes
   every step's post-action output and buries the failure.
 - `Start-Process -RedirectStandardError <f>` — a GUI-subsystem exe has no console,
