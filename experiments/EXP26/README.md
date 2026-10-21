@@ -28,7 +28,7 @@ before it can be released.
   has both `gcc.exe` and `windres.exe`, and fails with that list otherwise.
   `rustup` then picks the channel from `rust-toolchain.toml`
   (`stable-x86_64-pc-windows-gnu`). Gates: core tests, app unit tests
-  (`--bin airqlality`), `cargo build --release`. `cargo fmt --check` and clippy
+  (`--bin airqlality`), `cargo build --profile dist`. `cargo fmt --check` and clippy
   run as **reports, not gates** - the tree is hand-formatted and a `--check` diff
   spans most of `core/` and `app/`, so adopting rustfmt is its own experiment.
   `Swatinem/rust-cache`, concurrency cancels superseded runs.
@@ -37,18 +37,29 @@ before it can be released.
   `workflow_dispatch`-only job that probes feasibility.
 - **Release (`.github/workflows/release.yml`).** On tag `v*` and on manual
   dispatch. Asserts `tag == workspace version` (parsed from `Cargo.toml`), reruns
-  the same tests, builds release, stages
+  the same tests, builds **`--profile dist`**, stages
   `AirQlality-v<ver>-windows-x64.zip` = `airqlality.exe` + `README.md` +
   `LICENSE` + `NOTICE`, writes `SHA256SUMS.txt`, then
   `gh release create --verify-tag --notes-from-tag` with `contents: write`.
-- **Release profile untouched.** `gpui_ce_windows` keeps `debug-assertions = true`
-  (no `fxc.exe` locally): the runner does have the Windows SDK, but a release
-  experiment should ship the binary kind already proven, not a new configuration.
-- **Artifact is one exe.** `objdump -p` on the local release exe lists only
+- **Artifact is one exe.** `objdump -p` on the built exe lists only
   system imports (UCRT `api-ms-win-crt-*`, `d3d11`/`d3dcompiler_47`/`dcomp`/
   `dxgi`/`dwrite`, `icuuc`, `uiautomationcore`, Win32) - no `libgcc_s_seh-1` and
   no `libwinpthread-1`. The `capture.ps1` comment about MinGW runtime DLLs is
   stale, which the verification below re-tests from the outside.
+- **A release profile that can actually ship (found the hard way).** The first
+  `v0.1.0` asset panicked at startup on this machine (`thread 'main' panicked at
+  ... gpui_platform.rs:56: failed to initialize Windows platform: Error creating
+  DirectWriteTextSystem ... os error 3`), while the locally built exe next to it
+  ran fine. Cause: with `debug-assertions` on, `gpui_ce_windows` compiles its
+  HLSL *at runtime* from `env!("CARGO_MANIFEST_DIR")/src/shaders.hlsl`
+  (`directx_renderer.rs:2355`, `canonicalize`), so the exe only starts where the
+  crate source tree exists - the builder's cargo registry. With them off, its
+  build script runs `fxc.exe` from the Windows SDK and `include!`s the bytecode
+  (`directx_renderer.rs:2393`). Therefore: new `[profile.dist]` (inherits
+  `release`, `debug-assertions = false` for that crate only); `release` stays the
+  local profile for a machine without the SDK, `dist` is what CI builds and what
+  the release ships. Nothing else in the workspace changes behaviour between the
+  two profiles.
 - **README.** A `Download` section (the zip, SmartScreen "More info -> Run
   anyway", Windows 10 1903+ for `icuuc.dll`) and CI / release / licence badges.
 - **Verification.** (1) green CI run linked from the branch push; (2) a
@@ -92,3 +103,14 @@ _Pending._
   and `windres`.
 - `gh run view <id> --log-failed` — use to read a red step; plain `--log` mixes
   every step's post-action output and buries the failure.
+- `Start-Process -RedirectStandardError <f>` — a GUI-subsystem exe has no console,
+  but Rust's panic still lands in the redirected file; that is how the `os error 3`
+  from DirectWrite init was found. Without `-Wait`, check `$p.HasExited` after a
+  few seconds: a healthy widget never exits, so `-Wait` hangs forever.
+- `[profile.release.package.gpui_ce_windows] debug-assertions = true` makes the
+  shipped exe depend on `CARGO_MANIFEST_DIR` at runtime (HLSL compiled from
+  `src/shaders.hlsl` in the *builder's* cargo registry). A `--release` exe only
+  runs where it was built; publish `--profile dist` instead.
+- Same-machine proof is not portability proof: the local release exe ran for
+  months because its baked path happened to exist here. Always launch the
+  downloaded asset, from a temp directory.

@@ -76,8 +76,11 @@ jobs:
       - name: app unit tests
         run: cargo test -p airqlality --bin airqlality
 
-      - name: release build
-        run: cargo build -p airqlality --release
+      # `--profile dist`, not `--release`: only the dist profile lets
+      # `gpui_ce_windows` run fxc.exe here and embed the HLSL bytecode, which is
+      # what makes the exe portable off this runner (see Cargo.toml).
+      - name: dist build
+        run: cargo build -p airqlality --profile dist
 
       - name: package the zip
         id: zip
@@ -87,7 +90,7 @@ jobs:
           $name = "AirQlality-v$ver-windows-x64"
           $stage = Join-Path 'dist' $name
           New-Item -ItemType Directory -Force -Path $stage | Out-Null
-          Copy-Item 'target\release\airqlality.exe' $stage
+          Copy-Item 'target\dist\airqlality.exe' $stage
           foreach ($doc in 'README.md', 'LICENSE', 'NOTICE') {
             if (-not (Test-Path $doc)) { throw "missing $doc" }
             Copy-Item $doc $stage

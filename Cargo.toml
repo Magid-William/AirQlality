@@ -40,3 +40,18 @@ strip = true
 # (our app, `core`, all other deps) remains a normal optimized release.
 [profile.release.package.gpui_ce_windows]
 debug-assertions = true
+
+# The shippable profile (EXP26). With `debug-assertions` on, `gpui_ce_windows`
+# compiles its HLSL *at runtime* from `env!("CARGO_MANIFEST_DIR")/src/shaders.hlsl`
+# - a path on the machine that built the exe. A `--release` exe therefore runs
+# only where that path exists (this dev box, where the crate is unpacked in the
+# cargo registry); anywhere else it dies at startup in DirectX/DirectWrite init
+# with `os error 3`. `dist` turns debug-assertions off for that crate only, so
+# its build script runs `fxc.exe` from the Windows SDK once and embeds the
+# bytecode. CI has the SDK; this machine does not, which is why `release` keeps
+# the workaround and `dist` is built by the pipeline.
+[profile.dist]
+inherits = "release"
+
+[profile.dist.package.gpui_ce_windows]
+debug-assertions = false

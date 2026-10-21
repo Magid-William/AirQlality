@@ -2,11 +2,15 @@ name: CI
 
 # Every push on every branch and every pull request (EXP26). The gates are the
 # same ones the experiments ran by hand: format, the two fast test suites, and a
-# real release build. The windowed E2E suite is deliberately NOT a gate - it
+# real shippable build (`--profile dist`, see Cargo.toml). The windowed E2E suite
+# is deliberately NOT a gate - it
 # needs a desktop and a GPU and takes ~250 s; `workflow_dispatch` runs it as a
 # probe instead, so we learn whether hosted runners can do it at all.
 on:
   push:
+    # Branches only: a tag push is the release workflow's job, and running the
+    # whole gate twice per release wastes ten minutes of a fresh build.
+    branches: ['**']
   pull_request:
   workflow_dispatch:
 
@@ -25,7 +29,7 @@ env:
 
 jobs:
   build:
-    name: fmt + tests + release build
+    name: fmt + tests + dist build
     runs-on: windows-2025
     timeout-minutes: 45
     steps:
@@ -83,8 +87,8 @@ jobs:
         continue-on-error: true
         run: cargo clippy -p airqlality-core -p airqlality --all-targets
 
-      - name: release build
-        run: cargo build -p airqlality --release
+      - name: dist build
+        run: cargo build -p airqlality --profile dist
 
       # The release asset is a single exe. Prove that claim instead of trusting
       # the local `objdump` run: a MinGW runtime import would break every machine
@@ -92,7 +96,7 @@ jobs:
       - name: release exe is self-contained
         shell: pwsh
         run: |
-          $exe = 'target\release\airqlality.exe'
+          $exe = 'target\dist\airqlality.exe'
           if (-not (Test-Path $exe)) { throw "missing $exe" }
           $imports = & objdump -p $exe |
             Select-String 'DLL Name:' |
