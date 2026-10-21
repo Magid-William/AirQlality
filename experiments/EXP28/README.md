@@ -74,29 +74,58 @@ checkmarks disagree with the gate.
   *(Assumption adopted.)*
 
 ## Conclusion (findings)
-_Pending._
+**Success (user, 2026-10-22).** The tray now has `Notify me on >` with three
+independent checks - `Closing the window` (default, checked), `Opening the
+window`, `Venting the window` - and the checked set is what the gate promises.
+
+What landed:
+- `notify::Targets` (pure) is the single source of truth: parse/serialize,
+  `allows`, `toggle`; `%APPDATA%\AirQlality\notify.txt` stores it as
+  `closed,open,vent` or `none`, with `AIRQLALITY_NOTIFY_ON` winning for a quick
+  try. A missing file is the pre-EXP28 default, so existing installs are
+  unchanged; `none` is an explicit silence.
+- `Gate` is generalized from one verdict to any enabled one, keeping EXP27's
+  hour-bucket rule: one balloon per run of each enabled verdict, a whole other
+  hour between runs to re-arm, same-hour flicker silent, and the demo wrap not a
+  new run. Closing only still gives 2 for `[green][orange][red][orange][red]
+  [orange]`; all three give 6 (one per segment type), which is the documented
+  consequence of asking about every band.
+- The submenu is a real `MF_POPUP` built from the stored choices on every open,
+  so the checkmarks cannot disagree with the gate; toggling flips the state,
+  saves, and takes effect immediately with the widget hidden.
+- Balloons gained a per-verdict title (`KEEP THE WINDOW CLOSED`, `OPEN THE
+  WINDOW`, `VENTILATE BRIEFLY`) and severity (warning for closed, info for the
+  optional two). The dump names the verdict and hour.
+
+Evidence: `EXP28-tray-menu.png` (submenu open, closing + venting checked,
+opening not), `EXP28-open-balloon.png` (the info-icon `OPEN THE WINDOW` toast),
+and the E2E dumps (`closed,vent` -> 2, `none` -> 0). Suite: core 64/64, app
+82/82 (+9 `notify`, +2 `tray`), windowed E2E 33/33 in 291 s.
+
+Limits / not proven:
+- The menu *click* itself is not automated. The submenu the shipping code builds
+  is read back with `GetMenuState`, and the saved file drives the E2E, so the
+  chain is covered - but no test presses the item. The screenshot is a real
+  right-click.
+- The choice is per machine and per session; a restart mid-run warns once, and
+  an `AIRQLALITY_NOTIFY_ON` override makes menu toggles look ignored (same
+  precedence as the API keys).
+- A green/vent notification is only as good as the fused, hourly data; the
+  once-per-run rule means a band that flips twice within one hour is reported
+  once.
 
 ## Learnings
-- A native tray submenu is `CreatePopupMenu` + one `AppendMenuW` per check + 
-  `AppendMenuW(main, MF_POPUP, submenu.0 as usize, label)`; the selected leaf id
-  comes back from `TrackPopupMenu(TPM_RETURNCMD)`, and `DestroyMenu(main)`
-  disposes the children. No new crate or feature.
-- The checkmarks can be proved without a GUI: build the **real** submenu with
-  `notify_submenu()` and read each item back with
-  `GetMenuState(submenu, id, MF_BYCOMMAND)`; `u32::MAX` means the item is
-  missing, and `state & MF_CHECKED.0` is the check.
-- The tray icon's slot moves between runs. Locate it by its verdict colour
-  (exact `#3fb950`/`#f85149`) in a ~500x60 strip of the bottom-right corner and
-  right-click its centre; `SendKeys "{DOWN}x4 {RIGHT}"` opens `Notify me on`
-  for the evidence shot. Pin the mock to an OPEN hour so no balloon covers the
-  corner.
-- A separate `notify.txt` avoids a lost update: `save_keys` rewrites
-  `config.json` wholesale from its own thread, so two writers would fight.
-- `set_verdict` runs before `tray::start` (EXP17), so `State.targets` must load
-  lazily on first use; a `Mutex::new` static also needs a `const fn`
-  constructor (`Targets::CLOSED_ONLY`, `Gate::new`).
-- Unit tests must pin `STATE.targets` and the older notify E2E tests set
-  `AIRQLALITY_NOTIFY_ON=closed`, or the suite reads the developer's own
-  `notify.txt` and fails where the user's choices differ.
-- `cargo test -p airqlality --test e2e_widget -- follows_the_saved_choices` and
-  `-- notify_none`: the two EXP28 runs, ~8 s and ~6 s.
+- Native tray submenu: `CreatePopupMenu`, one `AppendMenuW` per check, then
+  `AppendMenuW(main, MF_POPUP, submenu.0 as usize, label)`; `TrackPopupMenu(
+  TPM_RETURNCMD)` returns the leaf id and `DestroyMenu(main)` disposes children.
+- Prove the checks without a GUI: build the real submenu with `notify_submenu`
+  and read each item with `GetMenuState(submenu, id, MF_BYCOMMAND)` (`u32::MAX`
+  = missing, `state & MF_CHECKED.0` = checked).
+- Keep the choice in its own `notify.txt`: `save_keys` rewrites `config.json`
+  wholesale, so two writers would lose updates. Load it lazily in `State` -
+  `set_verdict` runs before `tray::start` - and pin it in tests, or the suite
+  reads the developer's own file.
+- The tray slot moves: find the icon by its verdict colour in a ~500x60
+  bottom-right strip, right-click its centre, then `SendKeys "{DOWN}x4 {RIGHT}"`
+  to open the submenu. Pin the mock to an OPEN hour so no balloon covers it
+  (`experiments/EXP28/capture-menu.ps1`).
