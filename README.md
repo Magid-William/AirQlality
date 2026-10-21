@@ -8,7 +8,7 @@ window for fresh air, and when?**
 It reads open air-quality data, turns it into a verdict and a timeline, and
 lives in the notification area so it is one click away instead of one more tab.
 
-![AirQlality in Cairo: VENT verdict, PM2.5 curve with forecast, day/night wave, noise estimate](experiments/EXP21/EXP21-real-cairo.png)
+![AirQlality in Cairo: OPEN verdict, PM2.5 curve with forecast, day/night wave, noise estimate](experiments/EXP25/EXP25-real-cairo.png)
 
 ![AirQlality's tray icon, tinted by the verdict, sitting in the Windows notification area](assets/tray.png)
 
@@ -18,9 +18,10 @@ lives in the notification area so it is one click away instead of one more tab.
   now, with the reason spelled out in a sentence.
 - **A timeline you can read** - 48 h of PM2.5 (solid past, dashed forecast),
   a min-max envelope when several sources disagree, a day/night wave, and a
-  dotted noise estimate.
-- **Next 24 h at a glance** - how many clean, mediocre and closed hours are
-  coming, and when the next clean stretch starts.
+  dotted noise estimate. Times read as `7:00 PM`; click the best window to
+  switch the frame to 24-hour.
+- **Next 24 h at a glance** - how many open, vent and closed hours are coming,
+  and when the next clean stretch starts.
 - **A best window**, clamped to the next 24 h instead of a single 19 h run
   across the whole series.
 - **Searchable locations** - 34,152 cities baked in (GeoNames), Cairo first;
@@ -97,7 +98,8 @@ They live **outside** the repository, in `%APPDATA%\AirQlality\config.json`:
 
 or in `AIRQLALITY_OPENAQ_KEY` / `AIRQLALITY_OWM_KEY` (they win over the file,
 and the prompt says so when one is set). Without a key the source is simply
-absent, and the header names only the sources that actually produced data.
+absent, and the footer credit names only the sources that actually produced
+data.
 
 Attribution and data licences are in [`NOTICE`](NOTICE) and
 [`core/assets/ATTRIBUTION.md`](core/assets/ATTRIBUTION.md). The noise curve is

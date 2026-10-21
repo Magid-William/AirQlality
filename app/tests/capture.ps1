@@ -31,7 +31,11 @@ param(
     # Optional: post a WM_MOUSEMOVE at this fraction (0..1) of the client area,
     # to exercise the chart's pointer hover (tooltip). Negative = skip.
     [double]$MouseFracX = -1,
-    [double]$MouseFracY = -1
+    [double]$MouseFracY = -1,
+    # Optional: post a left click at this fraction (0..1) of the client area,
+    # to exercise a clickable control (EXP25's clock toggle). Negative = skip.
+    [double]$ClickFracX = -1,
+    [double]$ClickFracY = -1
 )
 
 # The app is a GNU/MinGW build; its runtime DLLs live beside the toolchain, not
@@ -130,6 +134,7 @@ if ($Press -ne "") {
         $vk = switch ($tok) {
             "tab"   { 0x09 }
             "enter" { 0x0D }
+            "space" { 0x20 }
             "esc"   { 0x1B }
             "up"    { 0x26 }
             "down"  { 0x28 }
@@ -169,6 +174,27 @@ if ($MouseFracX -ge 0 -and $MouseFracY -ge 0 -and $h -ne [IntPtr]::Zero) {
     $my = [int]($MouseFracY * $ch)
     $lp = [IntPtr]((($my -band 0xFFFF) -shl 16) -bor ($mx -band 0xFFFF))
     [void][W]::PostMessage($h, 0x0200, [IntPtr]0, $lp)   # WM_MOUSEMOVE
+    Start-Sleep -Milliseconds 600
+}
+
+if ($ClickFracX -ge 0 -and $ClickFracY -ge 0 -and $h -ne [IntPtr]::Zero) {
+    # A click needs the pointer to be over the control first (the backend tracks
+    # hover from WM_MOUSEMOVE), then WM_LBUTTONDOWN/UP with MK_LBUTTON set on the
+    # move that precedes them, as Windows itself sends it.
+    Show-AppWindow $h
+    Start-Sleep -Milliseconds 300
+    $cr = New-Object W+RECT
+    [W]::GetClientRect($h, [ref]$cr) | Out-Null
+    $cw = $cr.Right - $cr.Left
+    $ch = $cr.Bottom - $cr.Top
+    $mx = [int]($ClickFracX * $cw)
+    $my = [int]($ClickFracY * $ch)
+    $lp = [IntPtr]((($my -band 0xFFFF) -shl 16) -bor ($mx -band 0xFFFF))
+    [void][W]::PostMessage($h, 0x0200, [IntPtr]0, $lp)         # WM_MOUSEMOVE
+    Start-Sleep -Milliseconds 100
+    [void][W]::PostMessage($h, 0x0201, [IntPtr]1, $lp)         # WM_LBUTTONDOWN (MK_LBUTTON)
+    Start-Sleep -Milliseconds 80
+    [void][W]::PostMessage($h, 0x0202, [IntPtr]0, $lp)         # WM_LBUTTONUP
     Start-Sleep -Milliseconds 600
 }
 

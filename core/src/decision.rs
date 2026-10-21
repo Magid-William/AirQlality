@@ -35,7 +35,7 @@ impl Verdict {
     pub fn advice(self) -> &'static str {
         match self {
             Verdict::Open => "Outdoor air is clean - open wide and air the room out.",
-            Verdict::Vent => "Air is mediocre - short ventilation bursts only (CO2 still builds up indoors).",
+            Verdict::Vent => "Outdoor air is not clean - short ventilation bursts only (CO2 still builds up indoors).",
             Verdict::KeepClosed => "Outdoor PM2.5 is high - keep the windows closed for now.",
         }
     }

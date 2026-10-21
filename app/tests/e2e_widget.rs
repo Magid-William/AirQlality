@@ -707,8 +707,10 @@ fn widget_e2e_accessibility_tree() {
         "\"role\": \"Label\"",
         "\"label\": \"KEEP CLOSED\"",
         "\"role\": \"Image\"",
-        // Trigger, API keys, search field (EXP24 added the keys button).
-        "\"tab_stop_count\": 3",
+        // Trigger, API keys, search field, best-window clock (EXP25).
+        "\"tab_stop_count\": 4",
+        // The banner's time is a real control, not decoration (EXP25).
+        "\"label\": \"Best window 2:00 AM to 6:00 AM, 5 hours. Switch to the 24-hour clock.\"",
     ] {
         assert!(
             doc.contains(needle),

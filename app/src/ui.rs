@@ -65,6 +65,26 @@ const BLINK: Duration = Duration::from_millis(530);
 /// The text-insertion caret glyph (a thin vertical bar).
 const CARET: &str = "\u{258f}";
 
+/// One time label in the format the user chose (EXP25).
+///
+/// The widget default is 12-hour - "6:00 PM", no leading zero - because that is
+/// how the app's own advice reads. Clicking the best-window time switches the
+/// whole frame to 24-hour for the session; the preference is deliberately not
+/// persisted, so a relaunch is 12-hour again.
+fn clock(time: &chrono::DateTime<chrono::FixedOffset>, use24: bool) -> String {
+    if use24 {
+        time.format("%H:%M").to_string()
+    } else {
+        // `%-I` is the 12-hour number without the leading zero chrono would add.
+        time.format("%-I:%M %p").to_string()
+    }
+}
+
+/// "1 source issue" / "3 source issues": the header chip's label (EXP25).
+fn issue_label(count: usize) -> String {
+    format!("{count} source issue{}", if count == 1 { "" } else { "s" })
+}
+
 /// When set, the app writes its accessibility tree (AccessKit JSON) to this path
 /// each frame, so the E2E can assert names/roles. Requires the platform to have
 /// activated accessibility (the E2E posts `WM_GETOBJECT`).
@@ -276,6 +296,19 @@ pub struct Widget {
     /// Whether the prompt's field has been focused for the current open state
     /// (focus is set on the next frame, which needs the window).
     prompt_focused: bool,
+    /// Whether times render as 24-hour. Clicking the best-window time flips it
+    /// for this session only (EXP25).
+    clock24: bool,
+    /// Focus target for that clock toggle; the only tab stop inside the banner.
+    clock_focus: FocusHandle,
+    /// How many sources failed in the last round. Non-zero (with data on
+    /// screen) draws the header's issue chip instead of a banner line (EXP25).
+    issue_count: usize,
+    /// For a rejected key, the prompt step that fixes it: clicking the chip
+    /// opens that step rather than retrying a request that will fail again.
+    issue_step: Option<Step>,
+    /// Focus target for the issue chip, so the detail is keyboard reachable.
+    issue_focus: FocusHandle,
 }
 
 impl Widget {
@@ -321,6 +354,11 @@ impl Widget {
             file_keys: persist::load_file_keys(),
             prompt_focus: cx.focus_handle(),
             prompt_focused: false,
+            clock24: false,
+            clock_focus: cx.focus_handle().tab_stop(true).tab_index(3),
+            issue_count: 0,
+            issue_step: None,
+            issue_focus: cx.focus_handle().tab_stop(true).tab_index(4),
         };
 
         // Test/demo seam (EXP24): open a key prompt at launch, at step 1 or 2,
@@ -850,6 +888,8 @@ impl Widget {
     fn refresh_now(&mut self, cx: &mut Context<Self>) {
         if self.series.is_none() {
             self.error = None;
+            self.issue_count = 0;
+            self.issue_step = None;
         }
         if self.spawn_real(cx) {
             tray_set_refreshing(&self.selected.label);
@@ -1058,6 +1098,8 @@ impl Widget {
             self.decision = None;
             self.stack = None;
             self.error = None;
+            self.issue_count = 0;
+            self.issue_step = None;
             tray_set_loading(&self.selected.label);
             self.spawn_real(cx);
         }
@@ -1082,11 +1124,21 @@ impl Widget {
     ///   when other data is showing, and only surfaced when there is nothing at
     ///   all to show.
     /// - anything else (network, parse) is a real failure: the last good fused
-    ///   data is kept and the failure becomes the "stale" note.
+    ///   data is kept and the failure becomes the header's issue chip (EXP25).
     fn apply_stack(&mut self, sources: Vec<SourceSeries>, failures: Vec<(&'static str, SourceError)>) {
         let mut outages: Vec<String> = Vec::new();
         let mut all: Vec<String> = Vec::new();
+        // The first refused key decides where the issue chip sends the user: a
+        // retry cannot fix a refused key, but the prompt can (EXP25).
+        let mut rejected_step: Option<Step> = None;
         for (label, error) in failures {
+            if matches!(error, SourceError::Rejected(_)) && rejected_step.is_none() {
+                rejected_step = match label {
+                    "OpenAQ" => Some(Step::Openaq),
+                    "OpenWeatherMap" => Some(Step::Owm),
+                    _ => None,
+                };
+            }
             let text = match &error {
                 // A refused key is not an outage and will not fix itself; say
                 // what it is and where to fix it (EXP24). A brand-new
@@ -1115,6 +1167,9 @@ impl Widget {
             } else {
                 all.join(" \u{b7} ")
             });
+            // Without data the message screen owns the story, not a chip.
+            self.issue_count = 0;
+            self.issue_step = None;
             // The tray must not sit on "refreshing..." after a round that brought
             // nothing back (EXP22) - but only when there is no data on screen to
             // keep: with stale data the last verdict is still the honest icon.
@@ -1131,20 +1186,26 @@ impl Widget {
                 self.series = Some(stack.fusion.series.clone());
                 self.decision = Some(stack.decision.clone());
                 self.stack = Some(stack);
+                self.issue_count = outages.len();
+                self.issue_step = rejected_step;
                 self.error = if outages.is_empty() {
                     None
                 } else {
                     Some(outages.join(" \u{b7} "))
                 };
             }
-            Err(e) => self.error = Some(e.to_string()),
+            Err(e) => {
+                self.error = Some(e.to_string());
+                self.issue_count = 1;
+                self.issue_step = None;
+            }
         }
     }
 
-    /// The sources named in the header. The strip below the header lists every
-    /// source with its value, so the header only needs the count — otherwise
-    /// three names push the location out of the window. With a single source it
-    /// is exactly "Open-Meteo", as before.
+    /// The sources named in the footer credit. The strip below the banner lists
+    /// every source with its value, so the credit only needs the count - three
+    /// names would crowd the caption. With a single source it is exactly
+    /// "Open-Meteo", as before (EXP19, moved to the footer in EXP25).
     fn source_label(&self) -> String {
         match &self.stack {
             Some(stack) if stack.multi() => format!("{} sources", stack.fusion.sources.len()),
@@ -1184,6 +1245,97 @@ impl Widget {
         }
     }
 
+    /// The verdict banner: what the air is now, the best window (the time is the
+    /// clock toggle), the day's census and the one-line why. The verdict word
+    /// lives in the header, and a failed source is the header chip, so neither is
+    /// repeated here (EXP25).
+    fn banner(
+        &self,
+        series: &Series,
+        decision: &Decision,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let pm_now = series.now().pm2_5;
+        let use24 = self.clock24;
+
+        let first: AnyElement = match decision.best_window {
+            Some(w) => {
+                let start = clock(&series.points[w.start].time, use24);
+                let end = clock(&series.points[w.end].time, use24);
+                let hours = w.hours();
+                let toggle_label = format!(
+                    "Best window {start} to {end}, {hours} hours. Switch to the {} clock.",
+                    if use24 { "12-hour" } else { "24-hour" }
+                );
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .text_sm()
+                    .text_color(rgb(TEXT))
+                    .child(format!(
+                        "PM2.5 {pm_now:.0} \u{b5}g/m\u{b3} now  \u{b7}  best window"
+                    ))
+                    .child(
+                        div()
+                            .id("clock-toggle")
+                            .role(Role::Button)
+                            .aria_label(toggle_label)
+                            .whitespace_nowrap()
+                            .cursor_pointer()
+                            .border_b_1()
+                            .border_color(rgb(AXIS))
+                            .track_focus(&self.clock_focus)
+                            .focus_visible(|s| s.border_color(rgb(FOCUS)).text_color(rgb(TEXT)))
+                            .hover(|s| s.text_color(rgb(TEXT)).border_color(rgb(FOCUS)))
+                            .on_click(cx.listener(|this, _ev, _window, cx| {
+                                this.clock24 = !this.clock24;
+                                cx.notify();
+                            }))
+                            .child(format!("{start} \u{2013} {end}")),
+                    )
+                    .child(format!("({hours} h)"))
+                    .into_any_element()
+            }
+            None => div()
+                .text_sm()
+                .text_color(rgb(TEXT))
+                .child(format!(
+                    "PM2.5 {pm_now:.0} \u{b5}g/m\u{b3} now  \u{b7}  no clean window in the next 24 h"
+                ))
+                .into_any_element(),
+        };
+
+        let mut banner = div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .px_4()
+            .py_3()
+            .child(first)
+            // The day's shape (EXP20): a census, not a run, so a long clean
+            // stretch can never be reported without the closed hours around it.
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child(day_shape_line(series, decision, use24)),
+            )
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child(decision.headline.advice()),
+            );
+
+        // Only a real stack adds a row, so single-source rendering is unchanged.
+        if let Some(stack) = self.stack.as_ref().filter(|stack| stack.multi()) {
+            banner = banner.child(sources_strip(stack));
+        }
+
+        banner
+    }
+
     /// The header. Its left side is the verdict status: a coloured square plus
     /// the status word, moved up from the banner so the label reads as a single
     /// row. Its right side is the location trigger: click to open the panel. The
@@ -1191,9 +1343,6 @@ impl Widget {
     /// correct even while loading.
     fn header(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let label = &self.selected.label;
-        // Attribution names every source actually in the stack (EXP19). With a
-        // single source this is exactly "Open-Meteo", as before.
-        let sources = self.source_label();
         let caret = if self.dropdown_open { "\u{25b4}" } else { "\u{25be}" };
 
         // Verdict status, shown once data has been evaluated; empty while
@@ -1222,6 +1371,48 @@ impl Widget {
             None => div().into_any_element(),
         };
 
+        // While data is on screen, a failed source is a small chip beside the
+        // verdict instead of a banner line: the detail is still one hover or
+        // keypress away, and the chart keeps the row it used to cost (EXP25).
+        let issue: AnyElement = match (&self.error, self.series.is_some(), self.issue_count) {
+            (Some(message), true, count) if count > 0 => {
+                let tip = message.clone();
+                div()
+                    .id("source-issue")
+                    .role(Role::Button)
+                    .aria_label(format!("{} {}", issue_label(count), message))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_1()
+                    .py(px(1.0))
+                    .text_xs()
+                    .text_color(rgb(VENT))
+                    .cursor_pointer()
+                    .border_1()
+                    .border_color(rgb(AXIS))
+                    .rounded_sm()
+                    .track_focus(&self.issue_focus)
+                    .focus_visible(|s| s.border_color(rgb(FOCUS)).text_color(rgb(TEXT)))
+                    .hover(|s| s.bg(rgb(PANEL_HOVER)).text_color(rgb(TEXT)))
+                    .tooltip(move |_, cx| {
+                        let text = tip.clone();
+                        cx.new(|_| Tip { text }).into()
+                    })
+                    .on_click(cx.listener(|this, _ev, _window, cx| {
+                        match this.issue_step {
+                            // A refused key will keep refusing: go where it is fixed.
+                            Some(step) => this.open_keys(step, cx),
+                            None => this.refresh_now(cx),
+                        }
+                    }))
+                    .child(div().w(px(6.0)).h(px(6.0)).bg(rgb(VENT)))
+                    .child(issue_label(count))
+                    .into_any_element()
+            }
+            _ => div().into_any_element(),
+        };
+
         div()
             .flex()
             .justify_between()
@@ -1229,7 +1420,14 @@ impl Widget {
             .px_4()
             .h(px(HEADER_H))
             .text_sm()
-            .child(status)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(status)
+                    .child(issue),
+            )
             .child(
                 div()
                     .flex()
@@ -1259,15 +1457,6 @@ impl Widget {
                             .on_click(cx.listener(|this, _ev, _window, cx| {
                                 this.open_keys(Step::Openaq, cx)
                             }))
-                            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, _window, cx| {
-                                match ev.keystroke.key.as_str() {
-                                    "enter" | "space" => {
-                                        this.open_keys(Step::Openaq, cx);
-                                        cx.stop_propagation();
-                                    }
-                                    _ => {}
-                                }
-                            }))
                             .child("API keys"),
                     )
                     .child(
@@ -1292,17 +1481,7 @@ impl Widget {
                             .aria_expanded(self.dropdown_open)
                             .aria_keyshortcuts("Ctrl+K")
                             .on_click(cx.listener(|this, _ev, window, cx| this.toggle_open(window, cx)))
-                            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
-                                // Enter / Space activate the trigger, like a button.
-                                match ev.keystroke.key.as_str() {
-                                    "enter" | "space" => {
-                                        this.toggle_open(window, cx);
-                                        cx.stop_propagation();
-                                    }
-                                    _ => {}
-                                }
-                            }))
-                            .child(format!("data \u{a9} {sources}  \u{b7}  {label}"))
+                            .child(label.clone())
                             .child(caret),
                     ),
             )
@@ -1728,14 +1907,23 @@ impl Widget {
         .into_any_element()
     }
 
-    fn footer(show_noise: bool, show_night: bool) -> impl IntoElement {
+    /// Footer: verdict legend on the left, source credit on the right (EXP25).
+    ///
+    /// The credit used to sit in the header, sharing the location trigger's
+    /// hover; a source name the user cannot click does not belong in the row of
+    /// things they can. As a footer caption it stays visible for the CC BY
+    /// attribution and carries the explanation in a tooltip.
+    fn footer(&self) -> impl IntoElement {
+        let show_noise = self.series.is_some() && self.noise.is_some();
+        let show_night = self.night;
+
         let mut legend = div()
             .flex()
             .items_center()
             .gap_2()
             .child(legend_item(OPEN, "open \u{2264}15"))
             .child(legend_item(VENT, "vent \u{2264}25"))
-            .child(legend_item(CLOSED, "closed"));
+            .child(legend_item(CLOSED, "closed >25"));
         if show_noise {
             legend = legend.child(legend_item(NOISE, "noise est."));
         }
@@ -1743,16 +1931,8 @@ impl Widget {
             legend = legend.child(legend_item_outlined(NIGHT, "night"));
         }
 
-        // One line at 560 px. With the night key present the row is full, so the
-        // axis key drops the two line-style words - the chart already shows a
-        // solid past and a dashed forecast, and there is no room to spell it out
-        // as well. Without the night key the original, longer key stays, so the
-        // default mock view keeps the exact footer it had before EXP21.
-        let axes = if show_night {
-            "PM2.5 \u{b5}g/m\u{b3}  \u{b7}  past  \u{b7}  forecast"
-        } else {
-            "N PM2.5 \u{b5}g/m\u{b3}  \u{b7}  solid past  \u{b7}  dashed forecast"
-        };
+        let credit = self.source_label();
+        let tip = self.credit_tip();
 
         div()
             .flex()
@@ -1763,7 +1943,66 @@ impl Widget {
             .text_xs()
             .text_color(rgb(MUTED))
             .child(legend)
-            .child(axes)
+            .child(
+                div()
+                    .id("source-credit")
+                    .text_color(rgb(MUTED))
+                    .tooltip(move |_, cx| {
+                        let text = tip.clone();
+                        cx.new(|_| Tip { text }).into()
+                    })
+                    .child(format!("data \u{a9} {credit}")),
+            )
+    }
+
+    /// The footer credit's tooltip: what Open-Meteo is, and which sources fed
+    /// the fused stack (EXP25). The visible caption names the stack; this says
+    /// which kind of evidence each one is.
+    fn credit_tip(&self) -> String {
+        match self.stack.as_ref().filter(|stack| stack.multi()) {
+            Some(stack) => {
+                let list = stack
+                    .fusion
+                    .sources
+                    .iter()
+                    .map(|source| match source.kind {
+                        Kind::Ground => format!("{} (ground station)", source.label),
+                        Kind::Model => format!("{} (model)", source.label),
+                    })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                format!(
+                    "Air-quality data from {list}. Each provider's licence is listed in NOTICE."
+                )
+            }
+            None => "Air-quality data from Open-Meteo, a free keyless weather and \
+                     air-quality API (CAMS model forecast). Open-Meteo data \
+                     \u{a9} Open-Meteo, CC BY 4.0; see NOTICE."
+                .to_string(),
+        }
+    }
+}
+
+/// A one-paragraph tooltip view (EXP25). The widget's only hover text before it
+/// was the chart's hand-positioned tooltip; this one is placed by gpui itself,
+/// so the header chip and the footer credit need no bounds bookkeeping.
+struct Tip {
+    text: String,
+}
+
+impl Render for Tip {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .max_w(px(340.0))
+            .px_2()
+            .py_1()
+            .bg(rgb(PANEL))
+            .border_1()
+            .border_color(rgb(AXIS))
+            .rounded_md()
+            .text_xs()
+            .text_color(rgb(TEXT))
+            .child(self.text.clone())
     }
 }
 
@@ -1980,8 +2219,7 @@ impl Render for Widget {
                 let night_slice = night_values.as_deref();
                 // The stack is only relevant when it is a real stack (EXP19).
                 let stack = self.stack.as_ref().filter(|s| s.multi());
-                root = root
-                    .child(render_banner(series, decision, self.error.as_deref(), stack));
+                root = root.child(self.banner(series, decision, cx));
                 root = root.child(render_canvas(
                     series,
                     decision,
@@ -1992,6 +2230,7 @@ impl Render for Widget {
                     noise_slice,
                     night_slice,
                     stack.map(|s| s.fusion.spread.as_slice()),
+                    self.clock24,
                     cx,
                 ));
                 if let Some(hover) = self.hover.filter(|&i| i < series.len()) {
@@ -2002,6 +2241,7 @@ impl Render for Widget {
                         self.chart_bounds.get(),
                         noise_slice,
                         stack,
+                        self.clock24,
                     ));
                 }
             }
@@ -2013,10 +2253,7 @@ impl Render for Widget {
             }
         }
 
-        root = root.child(Self::footer(
-            self.series.is_some() && self.noise.is_some(),
-            self.night,
-        ));
+        root = root.child(self.footer());
 
         if self.dropdown_open {
             root = root.child(self.dropdown(search_focused, cx));
@@ -2041,111 +2278,43 @@ impl Render for Widget {
     }
 }
 
-/// The verdict banner (best window + "why"), plus a stale note when the last
-/// refresh failed but older data is still shown. The verdict headline itself
-/// lives in the header now (see `header`), so it is not repeated here.
-fn render_banner(
-    series: &Series,
-    decision: &Decision,
-    stale: Option<&str>,
-    stack: Option<&Stack>,
-) -> impl IntoElement {
-    let headline = decision.headline;
-    let pm_now = series.now().pm2_5;
-
-    let subline = match decision.best_window {
-        Some(w) => format!(
-            "PM2.5 {:.0} \u{b5}g/m\u{b3} now  \u{b7}  best window {} \u{2013} {} ({} h)",
-            pm_now,
-            series.points[w.start].time.format("%H:%M"),
-            series.points[w.end].time.format("%H:%M"),
-            w.hours()
-        ),
-        None => format!(
-            "PM2.5 {:.0} \u{b5}g/m\u{b3} now  \u{b7}  no clean window in the next 24 h",
-            pm_now
-        ),
-    };
-
-    let mut banner = div()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .px_4()
-        .py_3()
-        .child(div().text_sm().text_color(rgb(TEXT)).child(subline))
-        // The day's shape (EXP20): a census, not a run, so a long clean stretch
-        // can never be reported without the closed hours around it.
-        .child(
-            div()
-                .text_xs()
-                .text_color(rgb(MUTED))
-                .child(day_shape_line(series, decision)),
-        )
-        .child(
-            div()
-                .text_xs()
-                .text_color(rgb(MUTED))
-                .child(headline.advice()),
-        );
-
-    // Only a real stack adds a row, so single-source rendering is unchanged.
-    if let Some(stack) = stack {
-        banner = banner.child(sources_strip(stack));
-    }
-
-    if let Some(msg) = stale {
-        banner = banner.child(
-            div()
-                .text_xs()
-                .text_color(rgb(VENT))
-                .child(if msg.contains("key rejected") {
-                    // A refused key is not the network being down: saying
-                    // "offline" for it contradicts the rest of the line.
-                    format!("showing last data \u{b7} {msg}")
-                } else {
-                    format!("offline \u{2014} showing last data \u{b7} {msg}")
-                }),
-        );
-    }
-
-    banner
-}
-
 /// The day's shape (EXP20), one line: how much of the next 24 h is openable, and
-/// when the next clean hour starts.
+/// when the next clean hour starts. The words match the headline and the legend
+/// (open / vent / closed) rather than the old `clean / mediocre / closed` (EXP25).
 ///
 /// Deliberately MUTED and never in the verdict colours: the banner sits in the
 /// top third of the window, where the E2E asserts that a `KEEP CLOSED` verdict
 /// paints **no** green at all. Colouring the counts would break that guarantee
 /// for no real information - the numbers are in the words.
-fn day_shape_line(series: &Series, decision: &Decision) -> String {
+fn day_shape_line(series: &Series, decision: &Decision, use24: bool) -> String {
     let shape = decision.shape;
     let mut line = format!(
-        "next {} h: {} clean \u{b7} {} mediocre \u{b7} {} closed",
+        "next {} h: {} open \u{b7} {} vent \u{b7} {} closed",
         shape.hours_covered, shape.clean, shape.mediocre, shape.closed
     );
-    // "clean from 14:00" only says something when that hour is still ahead.
+    // "clean from 6 PM" only says something when that hour is still ahead.
     if let Some(first) = shape.first_clean.filter(|&i| i > series.now_index) {
         line.push_str(&format!(
             " \u{b7} clean from {}",
-            series.points[first].time.format("%H:%M")
+            clock(&series.points[first].time, use24)
         ));
     }
     line
 }
 
 /// The same census as a sentence, for the chart's text alternative (WCAG 1.1.1).
-fn day_shape_sentence(series: &Series, decision: &Decision) -> String {
+/// Spoken form keeps the explanation "vent" only implies, and uses the chosen
+/// clock (EXP25).
+fn day_shape_sentence(series: &Series, decision: &Decision, use24: bool) -> String {
     let shape = decision.shape;
     let mut sentence = format!(
-        "In the next {} hours, {} clean, {} mediocre and {} to keep the window closed.",
+        "In the next {} hours: {} open, {} when short ventilation is fine, and {} to keep the window closed.",
         shape.hours_covered, shape.clean, shape.mediocre, shape.closed
     );
     if let Some(first) = shape.first_clean.filter(|&i| i > series.now_index) {
         sentence.push_str(&format!(
             " The first clean hour is at {}.",
-            series.points[first].time.format("%H:%M")
+            clock(&series.points[first].time, use24)
         ));
     }
     sentence
@@ -2226,6 +2395,7 @@ fn render_canvas(
     noise: Option<&[f32]>,
     night: Option<&[f32]>,
     spread: Option<&[Spread]>,
+    use24: bool,
     cx: &mut Context<Widget>,
 ) -> impl IntoElement {
     let values: Vec<f32> = series.points.iter().map(|p| p.pm2_5).collect();
@@ -2237,8 +2407,8 @@ fn render_canvas(
         Some(w) => format!(
             "Air quality timeline for {location}. Now PM2.5 {now:.0} micrograms per cubic \
              metre. Best window {} to {} ({} hours).",
-            series.points[w.start].time.format("%H:%M"),
-            series.points[w.end].time.format("%H:%M"),
+            clock(&series.points[w.start].time, use24),
+            clock(&series.points[w.end].time, use24),
             w.hours()
         ),
         None => format!(
@@ -2258,7 +2428,7 @@ fn render_canvas(
     };
 
     // The day's shape, in words (EXP20).
-    let label = format!("{label} {}", day_shape_sentence(series, decision));
+    let label = format!("{label} {}", day_shape_sentence(series, decision, use24));
 
     // ...and what the shading behind the curve means (EXP21).
     let label = match night {
@@ -2325,6 +2495,7 @@ fn render_tooltip(
     bounds: Bounds<Pixels>,
     noise: Option<&[f32]>,
     stack: Option<&Stack>,
+    use24: bool,
 ) -> AnyElement {
     let point = &series.points[hover];
     let verdict = decision
@@ -2340,7 +2511,11 @@ fn render_tooltip(
     let left = (x - TOOLTIP_W / 2.0).clamp(min_left, max_left);
     let top = (f32::from(bounds.origin.y) + 10.0).max(0.0);
 
-    let when = point.time.format("%a %I:%M %p").to_string();
+    let when = format!(
+        "{} {}",
+        point.time.format("%a"),
+        clock(&point.time, use24)
+    );
     let phase = if hover >= series.now_index {
         "forecast"
     } else {
@@ -2777,8 +2952,8 @@ mod tests {
         // Mock "now" is 14:00 (26 ug/m3, closed); the clean run opens at 02:00.
         let (series, decision) = mock_decision();
         assert_eq!(
-            day_shape_line(&series, &decision),
-            "next 24 h: 5 clean \u{b7} 17 mediocre \u{b7} 2 closed \u{b7} clean from 02:00"
+            day_shape_line(&series, &decision, false),
+            "next 24 h: 5 open \u{b7} 17 vent \u{b7} 2 closed \u{b7} clean from 2:00 AM"
         );
     }
 
@@ -2786,9 +2961,9 @@ mod tests {
     fn the_day_shape_sentence_is_what_a_screen_reader_hears() {
         let (series, decision) = mock_decision();
         assert_eq!(
-            day_shape_sentence(&series, &decision),
-            "In the next 24 hours, 5 clean, 17 mediocre and 2 to keep the window closed. \
-             The first clean hour is at 02:00."
+            day_shape_sentence(&series, &decision, false),
+            "In the next 24 hours: 5 open, 17 when short ventilation is fine, and 2 to keep \
+             the window closed. The first clean hour is at 2:00 AM."
         );
     }
 
@@ -2813,8 +2988,8 @@ mod tests {
         let series = Series::new("test", points, 0);
         let decision = evaluate_hourly(vec![Verdict::Open; HORIZON_HOURS + 1], 0);
 
-        let line = day_shape_line(&series, &decision);
-        assert_eq!(line, "next 24 h: 24 clean \u{b7} 0 mediocre \u{b7} 0 closed");
+        let line = day_shape_line(&series, &decision, false);
+        assert_eq!(line, "next 24 h: 24 open \u{b7} 0 vent \u{b7} 0 closed");
         assert!(!line.contains("clean from"));
     }
 
@@ -2837,8 +3012,35 @@ mod tests {
         let series = Series::new("test", points, 0);
         let decision = evaluate_hourly(vec![Verdict::KeepClosed; HORIZON_HOURS + 1], 0);
 
-        let line = day_shape_line(&series, &decision);
-        assert_eq!(line, "next 24 h: 0 clean \u{b7} 0 mediocre \u{b7} 24 closed");
+        let line = day_shape_line(&series, &decision, false);
+        assert_eq!(line, "next 24 h: 0 open \u{b7} 0 vent \u{b7} 24 closed");
         assert!(!line.contains("clean from"));
+    }
+
+    #[test]
+    fn clock_is_twelve_hour_by_default_and_switches_to_24() {
+        use chrono::{FixedOffset, TimeZone};
+
+        let tz = FixedOffset::east_opt(2 * 3600).unwrap();
+        let at = |hour, minute| {
+            tz.with_ymd_and_hms(2026, 10, 4, hour, minute, 0)
+                .single()
+                .unwrap()
+        };
+        // 12-hour is the default; no leading zero, and the two edges are 12.
+        assert_eq!(clock(&at(18, 0), false), "6:00 PM");
+        assert_eq!(clock(&at(9, 5), false), "9:05 AM");
+        assert_eq!(clock(&at(0, 5), false), "12:05 AM");
+        assert_eq!(clock(&at(12, 0), false), "12:00 PM");
+        // The same instants after the click.
+        assert_eq!(clock(&at(18, 0), true), "18:00");
+        assert_eq!(clock(&at(9, 5), true), "09:05");
+        assert_eq!(clock(&at(0, 5), true), "00:05");
+    }
+
+    #[test]
+    fn issue_label_agrees_with_the_count() {
+        assert_eq!(issue_label(1), "1 source issue");
+        assert_eq!(issue_label(3), "3 source issues");
     }
 }
