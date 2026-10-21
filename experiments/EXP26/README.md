@@ -68,9 +68,15 @@ before it can be released.
   directory, unzipped, hash checked, and the exe launched with `PATH` reduced to
   `System32`, screenshot showing real Cairo data; (5) `gh run view` timings.
   Results: cold CI run `39648321358` green in 17m43s - core 64/64, app 67/67,
-  release build, `59 system imports, no MinGW runtime, 32.5 MiB`; the red probe
-  (`19da922`, branch deleted afterwards) failed at `core tests` with the later
-  steps skipped.
+  `59 system imports, no MinGW runtime, 32.5 MiB`; the red probe (`19da922`,
+  branch deleted afterwards) failed at `core tests` with the later steps skipped.
+  Final release `v0.1.0` (`39657483271`, green): zip 13,048,497 bytes, SHA-256
+  matches `SHA256SUMS.txt`, and the extracted exe ran from
+  `%TEMP%\exp26-release2\extracted` with `PATH=C:\Windows\System32;C:\Windows`,
+  rendering the real-data timeline (OPEN, PM2.5 13, one source issue) at
+  700x425 - evidence `EXP26-release-exe.png`. The first `v0.1.0` release and tag
+  were deleted and recreated: their asset was the machine-bound `--release`
+  build described above, and nothing had been announced.
 - **May touch:** `.github/workflows/`, `experiments/EXP26/`, `experiments-overview.md`,
   `README.md`, tag `v0.1.0`, the GitHub release, repository Actions settings.
 - **Off-limits:** `core/` and `app/` source and tests (no code changes at all,
