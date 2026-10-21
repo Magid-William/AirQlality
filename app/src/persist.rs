@@ -129,6 +129,38 @@ fn merge_keys(existing_json: &str, keys: &Keys) -> String {
     serde_json::Value::Object(object).to_string()
 }
 
+/// Where the notification choices live (EXP28). Deliberately a separate file
+/// from the keys: `config.json` is rewritten wholesale by the key prompts, and
+/// the tray menu writes this one from its own thread.
+fn notify_path() -> Option<PathBuf> {
+    Some(config_dir()?.join("notify.txt"))
+}
+
+/// The verdicts that may notify, from `%APPDATA%\AirQlality\notify.txt`.
+///
+/// `AIRQLALITY_NOTIFY_ON` wins over the file so a test (or a quick try) can pick
+/// the set without touching the saved choice. A missing or unreadable file is
+/// the pre-EXP28 default: closing only.
+pub fn load_notify() -> crate::notify::Targets {
+    if let Ok(value) = std::env::var("AIRQLALITY_NOTIFY_ON") {
+        return crate::notify::Targets::parse(&value);
+    }
+    notify_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|text| crate::notify::Targets::parse(&text))
+        .unwrap_or_default()
+}
+
+/// Best-effort save of the notification choices (EXP28). Errors are ignored,
+/// like every other file in this directory.
+pub fn save_notify(targets: &crate::notify::Targets) {
+    let Some(path) = notify_path() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let _ = std::fs::write(path, targets.to_text());
+}
+
 fn env_key(name: &str) -> Option<String> {
     std::env::var(name)
         .ok()

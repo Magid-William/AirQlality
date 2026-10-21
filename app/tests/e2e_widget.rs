@@ -1129,6 +1129,9 @@ fn widget_e2e_notifies_keep_closed() {
         .env("AIRQLALITY_SOURCE", "mock")
         .env("AIRQLALITY_FREEZE_NOW", "1")
         .env("AIRQLALITY_NOTIFY_DUMP", &dump)
+        // Pin the choices: these tests must not depend on the developer's own
+        // notify.txt (EXP28).
+        .env("AIRQLALITY_NOTIFY_ON", "closed")
         .output()
         .expect("failed to spawn capture.ps1");
 
@@ -1189,6 +1192,9 @@ fn widget_e2e_notify_is_silent_when_open() {
         .env("AIRQLALITY_FREEZE_NOW", "1")
         .env("AIRQLALITY_MOCK_NOW", "36")
         .env("AIRQLALITY_NOTIFY_DUMP", &dump)
+        // Pin the choices: these tests must not depend on the developer's own
+        // notify.txt (EXP28).
+        .env("AIRQLALITY_NOTIFY_ON", "closed")
         .output()
         .expect("failed to spawn capture.ps1");
 
@@ -1253,6 +1259,9 @@ fn widget_e2e_notify_once_per_red_segment() {
         .env("AIRQLALITY_MOCK_PM25", &pattern)
         .env("AIRQLALITY_TICK_MS", "200")
         .env("AIRQLALITY_NOTIFY_DUMP", &dump)
+        // Pin the choices: these tests must not depend on the developer's own
+        // notify.txt (EXP28).
+        .env("AIRQLALITY_NOTIFY_ON", "closed")
         .output()
         .expect("failed to spawn capture.ps1");
 
@@ -1327,6 +1336,9 @@ fn widget_e2e_notify_long_red_run_is_one_warning() {
         .env("AIRQLALITY_MOCK_PM25", &pattern)
         .env("AIRQLALITY_TICK_MS", "200")
         .env("AIRQLALITY_NOTIFY_DUMP", &dump)
+        // Pin the choices: these tests must not depend on the developer's own
+        // notify.txt (EXP28).
+        .env("AIRQLALITY_NOTIFY_ON", "closed")
         .output()
         .expect("failed to spawn capture.ps1");
 
@@ -1353,6 +1365,122 @@ fn widget_e2e_notify_long_red_run_is_one_warning() {
 
     let _ = std::fs::remove_file(&png);
     let _ = std::fs::remove_file(&dump);
+}
+
+/// EXP28: run the widget on a synthetic sequence with a chosen `notify.txt` in
+/// an isolated `%APPDATA%`, and return the balloon dump plus the capture log.
+fn run_with_notify_on(tag: &str, notify_on: &str, pattern: &str) -> (String, String) {
+    let exe = env!("CARGO_BIN_EXE_airqlality");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("capture.ps1");
+    let appdata = std::env::temp_dir().join(format!(
+        "airqlality-notify-{tag}-appdata-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&appdata);
+    std::fs::create_dir_all(appdata.join("AirQlality")).expect("create temp APPDATA");
+    std::fs::write(appdata.join("AirQlality").join("notify.txt"), notify_on)
+        .expect("write notify.txt");
+
+    let png = std::env::temp_dir().join(format!(
+        "airqlality-e2e-notify-{tag}-{}.png",
+        std::process::id()
+    ));
+    let dump = std::env::temp_dir().join(format!(
+        "airqlality-e2e-notify-{tag}-{}.jsonl",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&png);
+    let _ = std::fs::remove_file(&dump);
+
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&script)
+        .arg("-Exe")
+        .arg(exe)
+        .arg("-Out")
+        .arg(&png)
+        .arg("-WaitSeconds")
+        .arg("3")
+        .env("APPDATA", &appdata)
+        .env("AIRQLALITY_SOURCE", "mock")
+        .env("AIRQLALITY_MOCK_PM25", pattern)
+        .env("AIRQLALITY_TICK_MS", "200")
+        .env("AIRQLALITY_NOTIFY_DUMP", &dump)
+        .env_remove("AIRQLALITY_NOTIFY_ON")
+        .env_remove("AIRQLALITY_FREEZE_NOW")
+        .output()
+        .expect("failed to spawn capture.ps1");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    assert!(
+        !stdout.contains("PROCESS_EXITED") && stdout.contains("SAVED"),
+        "app did not render ({tag}):\n{stdout}"
+    );
+    let state = std::fs::read_to_string(&dump).unwrap_or_default();
+
+    let _ = std::fs::remove_file(&png);
+    let _ = std::fs::remove_file(&dump);
+    let _ = std::fs::remove_dir_all(&appdata);
+    (state, stdout)
+}
+
+/// EXP28: the saved choices decide what warns. With `closed,vent` in
+/// `notify.txt`, a vent run and a closed run warn once each, while the clean
+/// hour that starts the sequence stays silent. Proves the file is read at
+/// launch *and* the gate honours it.
+#[test]
+fn widget_e2e_notify_follows_the_saved_choices() {
+    let _guard = window_guard();
+
+    // open, vent x2, closed x2, then clean - beyond the harness's reach.
+    let mut pattern = String::from("12,20,20,30,30,12");
+    for _ in 0..40 {
+        pattern.push_str(",12");
+    }
+    let (state, log) = run_with_notify_on("choices", "closed,vent", &pattern);
+    eprintln!("e2e notify (closed,vent): {state}");
+    let lines: Vec<&str> = state.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(
+        lines.len(),
+        2,
+        "one balloon for the vent run and one for the closed run:\n{state}\n{log}"
+    );
+    assert!(
+        lines[0].contains("\"verdict\":\"vent\"")
+            && lines[0].contains("\"title\":\"VENTILATE BRIEFLY\""),
+        "the vent run must warn first:\n{state}"
+    );
+    assert!(
+        lines[1].contains("\"verdict\":\"closed\"")
+            && lines[1].contains("\"title\":\"KEEP THE WINDOW CLOSED\""),
+        "the closed run must warn second:\n{state}"
+    );
+    assert!(
+        lines.iter().all(|l| l.contains("\"ok\":true")),
+        "Shell_NotifyIcon(NIF_INFO) was rejected:\n{state}"
+    );
+    assert!(
+        !state.contains("\"verdict\":\"open\""),
+        "the user did not ask about opening:\n{state}"
+    );
+}
+
+/// EXP28: `notify.txt = none` means silence, even through a long closed run.
+#[test]
+fn widget_e2e_notify_none_is_silent() {
+    let _guard = window_guard();
+
+    let mut pattern = String::from("12,30,30,30,30,12");
+    for _ in 0..40 {
+        pattern.push_str(",12");
+    }
+    let (state, log) = run_with_notify_on("none", "none", &pattern);
+    assert!(
+        state.trim().is_empty(),
+        "nothing is selected, so nothing may notify:\n{state}\n{log}"
+    );
 }
 
 /// The inferred noise overlay (EXP16). With `AIRQLALITY_NOISE=on` a second,

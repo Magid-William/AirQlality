@@ -28,22 +28,23 @@ use windows::core::PCWSTR;
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
-    Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP,
+    Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIIF_INFO,
     NIIF_RESPECT_QUIET_TIME, NIIF_WARNING, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION,
     NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
-    DestroyMenu, DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics, IsWindow,
-    IsWindowVisible, PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow,
-    ShowWindow, TrackPopupMenu, TranslateMessage, HICON, MENU_ITEM_FLAGS, MF_CHECKED, MF_GRAYED,
-    MF_SEPARATOR, MF_STRING, MSG, SM_CXSMICON, SM_CYSMICON, SW_HIDE, SW_RESTORE, TPM_NONOTIFY,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_DESTROY, WM_LBUTTONUP,
-    WM_NULL, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
+    DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics, IsWindow, IsWindowVisible,
+    PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, ShowWindow, TrackPopupMenu,
+    TranslateMessage, HICON, HMENU, MENU_ITEM_FLAGS, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR,
+    MF_STRING, MSG, SM_CXSMICON, SM_CYSMICON, SW_HIDE, SW_RESTORE, TPM_NONOTIFY, TPM_RETURNCMD,
+    TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_DESTROY, WM_LBUTTONUP, WM_NULL,
+    WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
 };
 
 use crate::commands::{self, Command};
 use crate::notify;
+use crate::persist;
 use crate::startup;
 use crate::theme;
 
@@ -63,6 +64,13 @@ const MENU_QUIT: u32 = 2;
 const MENU_STARTUP: u32 = 3;
 const MENU_REFRESH: u32 = 4;
 const MENU_KEYS: u32 = 5;
+/// The "Notify me on" submenu's three checks (EXP28).
+const MENU_NOTIFY_CLOSED: u32 = 6;
+const MENU_NOTIFY_OPEN: u32 = 7;
+const MENU_NOTIFY_VENT: u32 = 8;
+
+/// The submenu's label.
+pub const NOTIFY_MENU: &str = "Notify me on";
 
 /// The hidden tray window's handle (0 until the tray thread has created it).
 static TRAY_HWND: AtomicIsize = AtomicIsize::new(0);
@@ -76,12 +84,16 @@ static TRAY_READY: AtomicBool = AtomicBool::new(false);
 struct State {
     color: u32,
     tip: String,
-    /// The warning decision (EXP17, EXP27): one balloon per `KeepClosed` run,
-    /// however many refreshes land inside it.
+    /// The warning decision (EXP17, EXP27): one balloon per run, however many
+    /// refreshes land inside it.
     gate: notify::Gate,
-    /// A balloon waiting for the tray icon to exist: (title, body, hour). Sent
-    /// by `add_icon`/`refresh_icon`, then cleared (EXP17).
-    pending: Option<(String, String, i64)>,
+    /// Which verdicts may notify (EXP28). `None` until first read, so the
+    /// cold-start warning still honours the saved choice: `set_verdict` runs
+    /// before the tray thread exists.
+    targets: Option<notify::Targets>,
+    /// A balloon waiting for the tray icon to exist: (title, body, hour,
+    /// verdict). Sent by `add_icon`/`refresh_icon`, then cleared (EXP17).
+    pending: Option<(String, String, i64, Verdict)>,
 }
 
 /// The desired icon, shared between the UI thread (writer) and tray thread.
@@ -89,8 +101,16 @@ static STATE: Mutex<State> = Mutex::new(State {
     color: theme::MUTED,
     tip: String::new(),
     gate: notify::Gate::new(),
+    targets: None,
     pending: None,
 });
+
+impl State {
+    /// The chosen notification targets, loaded once from disk (EXP28).
+    fn targets(&mut self) -> notify::Targets {
+        *self.targets.get_or_insert_with(persist::load_notify)
+    }
+}
 
 /// Map a verdict to the widget's palette (identical to the header chip/legend).
 pub fn color_for(verdict: Verdict) -> u32 {
@@ -137,7 +157,8 @@ pub fn start(window_hwnd: isize) {
 }
 
 /// Point the icon at a verdict: colour + tooltip, and warn the user if this
-/// reading starts a fresh `KeepClosed` run (EXP17, EXP27).
+/// reading starts a fresh run of a verdict they asked about (EXP17, EXP27,
+/// EXP28).
 ///
 /// `hour` is the unix-hour bucket of the *reading* (`series.now().time`), not
 /// the wall clock: a refresh that re-evaluates the same hour is not a new run.
@@ -149,9 +170,10 @@ pub fn set_verdict(verdict: Verdict, location: &str, pm2_5: f32, hour: i64) {
             "AirQlality \u{00b7} {location} \u{00b7} {}",
             verdict.label()
         );
-        if state.gate.observe(verdict, hour) {
-            let (title, body) = notify::message(location, pm2_5);
-            state.pending = Some((title, body, hour));
+        let targets = state.targets();
+        if state.gate.observe(verdict, hour, &targets) {
+            let (title, body) = notify::message(verdict, location, pm2_5);
+            state.pending = Some((title, body, hour, verdict));
         }
     }
     nudge();
@@ -241,6 +263,60 @@ pub fn toggle_label(visible: bool) -> &'static str {
     } else {
         "Show"
     }
+}
+
+/// The flags for one "Notify me on" check (EXP28): a native checkmark when the
+/// verdict is selected, plain text when it is not.
+pub fn notify_item_flags(checked: bool) -> MENU_ITEM_FLAGS {
+    if checked {
+        MF_STRING | MF_CHECKED
+    } else {
+        MF_STRING
+    }
+}
+
+/// The three entries of the "Notify me on" submenu in menu order (EXP28):
+/// command id, label, checked. The label is the user's wording, not the
+/// verdict's uppercase label: the menu is a setting, not an alarm.
+pub fn notify_menu_items(targets: &notify::Targets) -> [(u32, &'static str, bool); 3] {
+    [
+        (
+            MENU_NOTIFY_CLOSED,
+            "Closing the window",
+            targets.closed(),
+        ),
+        (MENU_NOTIFY_OPEN, "Opening the window", targets.open()),
+        (MENU_NOTIFY_VENT, "Venting the window", targets.vent()),
+    ]
+}
+
+/// Build the real submenu from the stored targets, so the checks the user sees
+/// and the gate reads come from one source (EXP28).
+unsafe fn notify_submenu(targets: &notify::Targets) -> Option<HMENU> {
+    let submenu = CreatePopupMenu().ok()?;
+    for (id, label, checked) in notify_menu_items(targets) {
+        let text = wide(label);
+        let _ = AppendMenuW(
+            submenu,
+            notify_item_flags(checked),
+            id as usize,
+            PCWSTR(text.as_ptr()),
+        );
+    }
+    Some(submenu)
+}
+
+/// Flip one notification choice from the menu and persist it (EXP28). Works
+/// while the widget is hidden: the gate reads this same state.
+fn toggle_notify(verdict: Verdict) {
+    let targets = {
+        let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut targets = state.targets();
+        targets.toggle(verdict);
+        state.targets = Some(targets);
+        targets
+    };
+    persist::save_notify(&targets);
 }
 
 /// The flags for the "Run at startup" menu item: a native checkmark when the
@@ -343,6 +419,7 @@ unsafe fn show_menu(hwnd: HWND) {
     let toggle = wide(toggle_label(visible));
     let refresh_label = wide("Refresh");
     let keys_label = wide("API keys...");
+    let notify_label = wide(NOTIFY_MENU);
     let startup_label = wide("Run at startup");
     let quit = wide("Quit");
     let _ = AppendMenuW(menu, MF_STRING, MENU_TOGGLE as usize, PCWSTR(toggle.as_ptr()));
@@ -361,6 +438,20 @@ unsafe fn show_menu(hwnd: HWND) {
         MENU_KEYS as usize,
         PCWSTR(keys_label.as_ptr()),
     );
+    // Which verdicts may notify: a real submenu of native checks (EXP28). The
+    // checks are read from the same state the gate uses, so they cannot lie.
+    let targets = {
+        let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        state.targets()
+    };
+    if let Some(submenu) = notify_submenu(&targets) {
+        let _ = AppendMenuW(
+            menu,
+            MF_POPUP,
+            submenu.0 as usize,
+            PCWSTR(notify_label.as_ptr()),
+        );
+    }
     // A native checkmark shows whether we are registered for login startup.
     let _ = AppendMenuW(
         menu,
@@ -402,6 +493,9 @@ unsafe fn show_menu(hwnd: HWND) {
         MENU_STARTUP => {
             startup::toggle();
         }
+        MENU_NOTIFY_CLOSED => toggle_notify(Verdict::KeepClosed),
+        MENU_NOTIFY_OPEN => toggle_notify(Verdict::Open),
+        MENU_NOTIFY_VENT => toggle_notify(Verdict::Vent),
         MENU_QUIT => request_quit(),
         _ => {}
     }
@@ -546,18 +640,23 @@ unsafe fn flush_pending(hwnd: HWND) {
         let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
         state.pending.take()
     };
-    let Some((title, body, hour)) = info else {
+    let Some((title, body, hour, verdict)) = info else {
         return;
     };
     let mut nid = base_nid(hwnd);
     nid.uFlags = NIF_INFO;
     nid.szInfoTitle = title_array(&title);
     nid.szInfo = info_array(&body);
-    // A warning that honours Focus Assist / quiet time and keeps the default
-    // notification sound.
-    nid.dwInfoFlags = NIIF_WARNING | NIIF_RESPECT_QUIET_TIME;
+    // A closed window is a warning; the optional opening/venting notes are
+    // information (EXP28). All honour Focus Assist / quiet time and keep the
+    // default notification sound.
+    nid.dwInfoFlags = if verdict == Verdict::KeepClosed {
+        NIIF_WARNING | NIIF_RESPECT_QUIET_TIME
+    } else {
+        NIIF_INFO | NIIF_RESPECT_QUIET_TIME
+    };
     let ok = Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool();
-    dump_notify(&title, &body, hour, ok);
+    dump_notify(verdict, &title, &body, hour, ok);
 }
 
 /// `NIM_DELETE` the icon (called from `WM_DESTROY`).
@@ -678,15 +777,21 @@ fn dump(color: u32, tip: &str, ok: bool) {
 
 /// Test seam: with `AIRQLALITY_NOTIFY_DUMP=<path>`, append one JSON line per
 /// balloon actually sent, so the E2E can assert the gate fired and the shell
-/// accepted the call, at the Win32 boundary (EXP17, EXP27). `hour` is the
-/// reading's unix-hour bucket, so a test can also say *when* it fired.
-fn dump_notify(title: &str, body: &str, hour: i64, ok: bool) {
+/// accepted the call, at the Win32 boundary (EXP17, EXP27). `verdict` says
+/// *which* promise the balloon belongs to (EXP28) and `hour` is the reading's
+/// unix-hour bucket.
+fn dump_notify(verdict: Verdict, title: &str, body: &str, hour: i64, ok: bool) {
     let Some(path) = std::env::var_os("AIRQLALITY_NOTIFY_DUMP") else {
         return;
     };
     let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    let verdict = match verdict {
+        Verdict::KeepClosed => "closed",
+        Verdict::Vent => "vent",
+        Verdict::Open => "open",
+    };
     let line = format!(
-        "{{\"verdict\":\"KEEP CLOSED\",\"hour\":{hour},\"title\":\"{}\",\"body\":\"{}\",\"ok\":{ok}}}\n",
+        "{{\"verdict\":\"{verdict}\",\"hour\":{hour},\"title\":\"{}\",\"body\":\"{}\",\"ok\":{ok}}}\n",
         esc(title),
         esc(body)
     );
@@ -703,6 +808,7 @@ fn dump_notify(title: &str, body: &str, hour: i64, ok: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use windows::Win32::UI::WindowsAndMessaging::{GetMenuState, MF_BYCOMMAND};
 
     #[test]
     fn color_matches_the_widget_palette() {
@@ -760,10 +866,51 @@ mod tests {
     }
 
     #[test]
+    fn notify_items_are_the_users_order_and_wording() {
+        let targets = notify::Targets::parse("closed,vent");
+        assert_eq!(
+            notify_menu_items(&targets),
+            [
+                (MENU_NOTIFY_CLOSED, "Closing the window", true),
+                (MENU_NOTIFY_OPEN, "Opening the window", false),
+                (MENU_NOTIFY_VENT, "Venting the window", true),
+            ]
+        );
+        assert_eq!(NOTIFY_MENU, "Notify me on");
+        assert!(notify_item_flags(true).contains(MF_CHECKED));
+        assert!(!notify_item_flags(false).contains(MF_CHECKED));
+    }
+
+    /// EXP28: the real submenu the tray appends, read back from Win32. Proves
+    /// the checks match the stored choices without opening a window.
+    #[test]
+    fn the_notify_submenu_checks_the_saved_choices() {
+        let targets = notify::Targets::parse("open,vent");
+        unsafe {
+            let submenu = notify_submenu(&targets).expect("create the notify submenu");
+            for (id, label, checked) in notify_menu_items(&targets) {
+                let state = GetMenuState(submenu, id, MF_BYCOMMAND);
+                assert_ne!(state, u32::MAX, "menu item {id} ({label}) is missing");
+                assert_eq!(
+                    state & MF_CHECKED.0 != 0,
+                    checked,
+                    "checkmark of {label} disagrees with the saved choices"
+                );
+            }
+            let _ = DestroyMenu(submenu);
+        }
+    }
+
+    #[test]
     fn a_refresh_keeps_the_run_and_a_loading_forgets_it() {
         // Both states are muted, but only `set_loading` starts a new closed
         // run. Checked on the shared state so the notification gate (EXP17,
-        // EXP27) cannot regress silently.
+        // EXP27) cannot regress silently. Pin the choices: the test must not
+        // depend on the developer's own notify.txt.
+        {
+            let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+            state.targets = Some(notify::Targets::CLOSED_ONLY);
+        }
         set_verdict(Verdict::KeepClosed, "Cairo, Egypt", 26.0, 100);
         {
             let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
