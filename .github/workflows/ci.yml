@@ -31,6 +31,25 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # TEMPORARY PROBE (removed once the real path is known).
+      - name: where is gcc
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          "--- where gcc/windres ---"
+          where.exe gcc
+          where.exe windres
+          "--- C:\msys64 ---"
+          Get-ChildItem C:\msys64 -Directory -Name -ErrorAction SilentlyContinue
+          "--- candidate gcc.exe ---"
+          foreach ($p in 'C:\msys64\ucrt64\bin\gcc.exe','C:\msys64\mingw64\bin\gcc.exe','C:\msys64\clang64\bin\gcc.exe','C:\mingw64\bin\gcc.exe','C:\ProgramData\mingw64\mingw64\bin\gcc.exe') {
+            "$p -> $(Test-Path $p)"
+          }
+          "--- C:\ dirs matching mingw ---"
+          Get-ChildItem C:\ -Directory -Name -Filter '*mingw*' -ErrorAction SilentlyContinue
+          "--- choco bin gcc ---"
+          Get-ChildItem 'C:\ProgramData\chocolatey\bin' -Filter 'gcc*' -ErrorAction SilentlyContinue | Select-Object -ExpandProperty FullName
+
       # The runner image ships MSYS2 with mingw-w64 gcc 15.2, but not on PATH.
       # `psm` needs `gcc` and `build.rs` needs `windres`; both are hard failures
       # if this step does not find them, so the error names the cause.
