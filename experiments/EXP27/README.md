@@ -90,3 +90,9 @@ _Pending._
   segment.
 - `cargo test -p airqlality --test e2e_widget -- per_red_segment` /
   `-- long_red_run`: substring filters against the test name, ~10 s and ~6 s.
+- Bite-proof: restoring the old rule (`fresh = previous != KeepClosed`) fails
+  `a_same_hour_flicker_is_one_segment` and
+  `a_flicker_in_the_hour_after_the_warning_does_not_rearm`; the hour-bucket
+  condition is what makes them pass. The E2E pair still passes either way (the
+  ticker evaluates one hour at a time), so the flicker fix lives in the unit
+  tests - do not "simplify" it away.
