@@ -76,5 +76,22 @@ in the commit metadata beyond the chosen identity, and no API key material.
 _Pending._
 
 ## Learnings
-- `git grep -n -I -E "..." -- .` — scan the tree only; add `git log --all -p`
+- `git grep -n -I -E "..." -- .` - scan the tree only; add `git log --all -p`
   for history, but expect `Cargo.lock` checksum noise.
+- `gh api user --jq .login` - the login is `Magid-William`; `gh auth status`
+  labels the account `Maged-William`, so confirm the login before
+  `gh repo create <owner>/<repo>` (a wrong owner is a bare `HTTP 404`).
+- `git bundle create <temp>\AirQlality-history.bundle --all` + `git bundle
+  verify <file>` - always, before squashing away history.
+- `git checkout --orphan`, `git add -A`, one commit, `git branch -M main`,
+  delete every old branch **and tag**, `git reflog expire --expire=now --all`,
+  `git gc --prune=now` - leaves one commit and a single pack (3.74 MiB);
+  a leftover tag silently keeps the old objects alive and pushes them.
+- `git rm --cached <file>` stages a deletion that the *next* `git commit`
+  picks up even if you only listed other paths - commit by path list, or
+  expect the deletion in an earlier commit.
+- PowerShell has no heredoc: write the commit message to a file and use
+  `git commit -F <file>`.
+- Verify from a fresh clone: `git clone <url> <temp>` then
+  `cargo test -p airqlality-core --offline` (64/64) proves the published tree,
+  not just the local one.
