@@ -34,7 +34,8 @@ before it can be released.
   `Swatinem/rust-cache`, concurrency cancels superseded runs.
   The windowed E2E suite **does** run on hosted runners: the probe run passed
   29/29 in 277.81 s, so it gates `main` and manual dispatches, but not every
-  branch push (five extra minutes buy little there).
+  branch push (five extra minutes buy little there). First gated run
+  (`39661215152`, commit `ddc8911`) is green with both jobs.
 - **Release (`.github/workflows/release.yml`).** On tag `v*` and on manual
   dispatch. Asserts `tag == workspace version` (parsed from `Cargo.toml`), reruns
   the same tests, builds **`--profile dist`**, stages
