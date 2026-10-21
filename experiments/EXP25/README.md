@@ -22,10 +22,72 @@ In the same 560x340 frame the header contains only interactive things (plus one 
 - [x] Re-baseline? - new evidence screenshots under `experiments/EXP25/`; the a11y `tab_stop_count` goes 3 -> 4 and the census unit strings change; pixel-count assertions stay in kind.
 
 ## Conclusion (findings)
-_Pending._
+**Recommended: success** (the user declares the status). One presentation-only pass
+removed four things that carried no information and made three that did:
+
+- **Header**: the source credit left the location row, so `Cairo, Egypt` is the
+  only thing that brightens on hover; the header now holds the verdict, an
+  optional issue chip, `API keys` and the location. `Ctrl+K` still opens it.
+- **Credit**: `data (c) Open-Meteo` (or `data (c) N sources`) sits in the footer,
+  where attribution belongs. Its tooltip says what Open-Meteo is (a free, keyless
+  weather/air-quality API, CAMS forecast), names every source in the stack and
+  points at NOTICE for licences. With only Open-Meteo answering (the user's case:
+  no OpenAQ key, OWM key refused), the credit says exactly that.
+- **Stale detail**: the long `showing last data ...` line is gone. A failed
+  source while data is on screen is now an amber `N source issue(s)` chip beside
+  the verdict; hover reads the full message, a screen reader gets it from the
+  aria label, and activating it opens the refused key's prompt (or retries a
+  network failure). With no data at all the message screen is unchanged.
+- **Vocabulary**: the next-24-h census reads `N open / N vent / N closed`, the
+  legend gained `closed >25`, and the VENT advice says "not clean" instead of
+  "mediocre" - the band name now matches the headline in every place. (The
+  internal `DayShape.mediocre` field keeps its historical name.)
+- **Clock**: every visible time is 12-hour by default (`7:00 PM - 1:00 AM (7 h)`,
+  `clean from 6 PM`, `Sun 3:00 PM`); clicking the best-window time flips the whole
+  frame to 24-hour for the session, and it is a labelled button reachable with
+  Tab + Enter. Deliberately not persisted: a relaunch is 12-hour again, which is
+  what "always 12h" asked for.
+- **Footer**: the right-hand `PM2.5 ug/m3 . past . forecast` key (and its stray
+  leading `N`) is deleted. The unit is in `PM2.5 12 ug/m3 now`; the chart tooltip
+  still says observed/forecast.
+- **Space**: the stale row cost one `text_xs` line plus a gap (~20 logical px);
+  the plot is `flex_1`, so those pixels went straight to the graph - the obvious
+  win in the real error frame (see `EXP25-real-issue.png`).
+
+Two defects surfaced while proving the interactions:
+
+- **Location trigger Enter was broken (pre-existing, EXP10)**: gpui-ce already
+  synthesises a click on keyup for Enter/Space on a focusable, clickable element,
+  and the extra `on_key_down` toggled the panel twice - it opened and closed in
+  the same keypress. The redundant handlers are removed from the trigger, the
+  API-keys button, the clock and the issue chip; Enter now works on all of them.
+- The test harness could post keys and mouse moves but not clicks, so the clock's
+  pointer path was unprovable; `capture.ps1` gained `-ClickFracX/-ClickFracY`.
+
+Not proven / manual: the 24-hour state is session-only by choice (no persistence
+test); the hover-only location glow and both tooltips are proven by screenshots
+(the built-in tooltip is mouse-only, so keyboard users get the issue detail from
+the aria label, not visually); no x-axis hour labels were added (left as its own
+experiment); the clock toggle has no E2E click test, only unit tests plus the
+`-ClickFrac` screenshot.
+
+Suite: core 64/64 (unchanged count; only the VENT advice string differs), app
+65 -> 67 (+`clock`, +`issue_label`), windowed E2E 29/29 in 250 s (a11y tab stops
+3 -> 4 and the clock button's label pinned). No pixel assertion was re-baselined:
+the night/verdict counts kept their meaning, and the mock frame still paints no
+green in the closed headline band.
+
+Evidence: `EXP25-real-cairo.png` (hero, clean real frame),
+`EXP25-real-issue.png` / `EXP25-real-issue-hover.png` (chip and its full
+message), `EXP25-mock.png` (12-hour), `EXP25-mock-24h.png` (after the click),
+`EXP25-mock-location-hover.png` (only the location brightens),
+`EXP25-mock-credit-hover.png` (what Open-Meteo is), `EXP25-mock-stack.png`
+(`data (c) 3 sources`), `EXP25-trigger-enter.png` (the Enter fix).
 
 ## Learnings
 - `$env:PATH = "C:\Users\MW\AppData\Local\mingw64\bin;" + $env:PATH; cargo build -p airqlality` - the MinGW-W64 toolchain is under `%LOCALAPPDATA%\mingw64`; without it the link fails on `-lktmw32`.
-- `cargo test -p airqlality --bin airqlality` - iterate on the view without flashing a window; the windowed E2E suite runs once, at the end.
-- gpui-ce already synthesizes a **click on keyup** for Enter/Space on a focusable, clickable element. Do not also handle Enter in `on_key_down`: the clock toggled twice (state true, then a synthetic click set it false). This also means the EXP10 location trigger was double-toggling (Enter opened and immediately closed the panel); removing the redundant handler fixed it.
-- `capture.ps1 -ClickFracX 0.5 -ClickFracY 0.185` posts a real left click at a fraction of the client area - use it to exercise a clickable control and screenshot the result (the ClickFrac pair was added in EXP25).
+- `cargo test -p airqlality --bin airqlality` - iterate on the view without flashing a window; run the windowed E2E suite once, at the end.
+- gpui-ce synthesises a **click on keyup** for Enter/Space on a focusable, clickable element: handle activation with `on_click` only. A second `on_key_down` toggles twice (this hid in the EXP10 location trigger as "Enter does nothing").
+- `capture.ps1 -ClickFracX/-ClickFracY` posts a real left click at a client-area fraction - use it to prove a click path; keys use `-Press "tab tab enter"`.
+- 12-hour without a leading zero is chrono `%-I:%M %p` (`%I` would print `06:00 PM`).
+
