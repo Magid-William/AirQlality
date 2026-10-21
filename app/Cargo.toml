@@ -1,0 +1,38 @@
+[package]
+name = "airqlality"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dev-dependencies]
+# PNG decoding for the end-to-end screenshot assertions (see tests/e2e_widget.rs).
+# The `image` crate is already in the dependency graph via gpui, so the cache is warm.
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+[dependencies]
+airqlality-core.workspace = true
+chrono.workspace = true
+# Tray -> widget refresh requests (EXP22): `bounded(1)` plus `try_send` coalesces
+# a burst of menu clicks into one pending refresh. Already in the graph via
+# `gpui-ce` (2.5.0), so this adds no download.
+async-channel = "2"
+gpui.workspace = true
+gpui_platform.workspace = true
+# The optional source keys live in a tiny JSON config (EXP19). `serde_json` is
+# already in the graph via `airqlality-core`, so this adds no download.
+serde_json.workspace = true
+# The tray's raw window handle: `gpui::Window` implements `HasWindowHandle`.
+raw-window-handle = "0.6"
+
+# Win32 for the notification-area icon (EXP11). The `windows` crate is already in
+# the graph via `gpui_ce_windows`, pinned at the same version, so this adds no
+# download. Only the feature groups the tray actually uses are enabled.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Gdi",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }

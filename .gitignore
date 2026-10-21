@@ -1,0 +1,20 @@
+# Rust build output
+target/
+
+# Build / run logs
+*.log
+
+# EXP08 data-generator download cache
+experiments/EXP08/tmp/
+
+# EXP16 data-generator download cache (GRIP4 raster)
+experiments/EXP16/tmp/
+
+# Editor / agent tooling state (screenshots, local settings)
+.openchamber/
+
+# Local, per-user state: API keys, last location (never committed)
+config.json
+location.txt
+.env
+*.local.json

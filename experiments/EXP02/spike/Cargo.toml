@@ -1,0 +1,11 @@
+[package]
+name = "spike"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# `gpui-ce` is the core; its lib name is `gpui`, so alias it for `use gpui::...`.
+gpui = { package = "gpui-ce", version = "0.2", default-features = false }
+# The app entry point (`application()`) + the Windows backend. On Windows this
+# pulls the wgpu renderer.
+gpui_platform = { package = "gpui_ce_platform", version = "0.1" }

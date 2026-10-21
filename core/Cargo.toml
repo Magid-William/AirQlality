@@ -1,0 +1,12 @@
+[package]
+name = "airqlality-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ureq.workspace = true
+native-tls.workspace = true

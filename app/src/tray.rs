@@ -1,0 +1,767 @@
+//! Windows notification-area (system tray) icon, tinted by the verdict (EXP11).
+//!
+//! gpui-ce has no tray API, so this is hand-rolled Win32 on a **dedicated
+//! thread**: a hidden top-level window owns one `Shell_NotifyIconW` icon, whose
+//! `HICON` is rebuilt (a 32-bit DIB -> `CreateIconIndirect`) whenever the verdict
+//! changes. The UI thread only stores the desired colour/tooltip and posts a
+//! refresh message, so it never blocks on the shell.
+//!
+//! The same thread owns the window lifecycle: left-click shows the widget,
+//! right-click pops up a Show/Hide + Refresh + Run at startup + Quit menu,
+//! and closing the window hides to the tray (via gpui's `on_window_should_close`)
+//! instead of quitting. The refresh item reaches the widget through
+//! [`crate::refresh`], not through a window message (EXP22).
+//!
+//! All colour logic lives in the pure [`icon_bgra`], and the close decision in
+//! [`close_action`], so both are unit-testable without touching the OS.
+
+#![cfg(windows)]
+
+use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::Mutex;
+use std::thread;
+
+use airqlality_core::Verdict;
+use windows::core::PCWSTR;
+use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Shell::{
+    Shell_NotifyIconW, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP,
+    NIIF_RESPECT_QUIET_TIME, NIIF_WARNING, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION,
+    NOTIFYICONDATAW, NOTIFYICON_VERSION_4,
+};
+use windows::Win32::UI::WindowsAndMessaging::{
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon,
+    DestroyMenu, DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics, IsWindow,
+    IsWindowVisible, PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow,
+    ShowWindow, TrackPopupMenu, TranslateMessage, HICON, MENU_ITEM_FLAGS, MF_CHECKED, MF_GRAYED,
+    MF_SEPARATOR, MF_STRING, MSG, SM_CXSMICON, SM_CYSMICON, SW_HIDE, SW_RESTORE, TPM_NONOTIFY,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_DESTROY, WM_LBUTTONUP,
+    WM_NULL, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
+};
+
+use crate::notify;
+use crate::refresh;
+use crate::startup;
+use crate::theme;
+
+/// The icon's 1px border: near-white reads against a dark taskbar, while the
+/// bright coloured fill keeps the square visible on a light one.
+const BORDER: u32 = 0xffffff;
+
+/// `Shell_NotifyIcon`'s callback message; LOWORD(lParam) is the event.
+const WM_TRAY: u32 = WM_APP + 1;
+/// Sent from the UI thread to ask the tray thread to repaint the icon.
+const WM_TRAY_REFRESH: u32 = WM_APP + 2;
+/// The (hwnd, uID) pair that names our icon in the notification area.
+const TRAY_ID: u32 = 1;
+/// Popup-menu command ids.
+const MENU_TOGGLE: u32 = 1;
+const MENU_QUIT: u32 = 2;
+const MENU_STARTUP: u32 = 3;
+const MENU_REFRESH: u32 = 4;
+
+/// The hidden tray window's handle (0 until the tray thread has created it).
+static TRAY_HWND: AtomicIsize = AtomicIsize::new(0);
+/// The app's top-level window, brought forward on a tray click (0 if unknown).
+static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
+/// Set by the tray's Quit so the next `WM_CLOSE` becomes a real quit.
+static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
+/// Whether the shell accepted the icon (so hiding always has a way back).
+static TRAY_READY: AtomicBool = AtomicBool::new(false);
+
+struct State {
+    color: u32,
+    tip: String,
+    /// Verdict of the last evaluation, so the notification gate can
+    /// edge-trigger (EXP17). `None` is "no reading yet", so a cold start into
+    /// `KeepClosed` warns exactly once.
+    last_verdict: Option<Verdict>,
+    /// A balloon waiting for the tray icon to exist: (title, body). Sent by
+    /// `add_icon`/`refresh_icon`, then cleared (EXP17).
+    pending: Option<(String, String)>,
+}
+
+/// The desired icon, shared between the UI thread (writer) and tray thread.
+static STATE: Mutex<State> = Mutex::new(State {
+    color: theme::MUTED,
+    tip: String::new(),
+    last_verdict: None,
+    pending: None,
+});
+
+/// Map a verdict to the widget's palette (identical to the header chip/legend).
+pub fn color_for(verdict: Verdict) -> u32 {
+    match verdict {
+        Verdict::Open => theme::OPEN,
+        Verdict::Vent => theme::VENT,
+        Verdict::KeepClosed => theme::CLOSED,
+    }
+}
+
+/// A `size * size`, 32bpp top-down **BGRA** buffer for the tray icon: a solid
+/// `color` square inside a 1px [`BORDER`]. Pure, so the colour contract is
+/// testable without Windows.
+pub fn icon_bgra(color: u32, size: u32) -> Vec<u8> {
+    let size = size.max(1);
+    let fill = bgra(color);
+    let border = bgra(BORDER);
+    let mut out = Vec::with_capacity((size * size * 4) as usize);
+    for y in 0..size {
+        for x in 0..size {
+            let edge = x == 0 || y == 0 || x == size - 1 || y == size - 1;
+            out.extend_from_slice(if edge { &border } else { &fill });
+        }
+    }
+    out
+}
+
+/// 0xRRGGBB -> `[B, G, R, 0xff]`, the byte order a 32bpp DIB expects.
+fn bgra(color: u32) -> [u8; 4] {
+    [
+        (color & 0xff) as u8,
+        ((color >> 8) & 0xff) as u8,
+        ((color >> 16) & 0xff) as u8,
+        0xff,
+    ]
+}
+
+/// Start the tray thread. `window_hwnd` is the app's top-level window (0 when it
+/// could not be resolved); it is used to show/hide the widget from the tray.
+pub fn start(window_hwnd: isize) {
+    let _ = thread::Builder::new()
+        .name("airqlality-tray".into())
+        .spawn(move || unsafe { run(window_hwnd) });
+}
+
+/// Point the icon at a verdict: colour + tooltip, and warn the user if this is a
+/// fresh transition into `KeepClosed` (EXP17).
+pub fn set_verdict(verdict: Verdict, location: &str, pm2_5: f32) {
+    {
+        let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        state.color = color_for(verdict);
+        state.tip = format!(
+            "AirQlality \u{00b7} {location} \u{00b7} {}",
+            verdict.label()
+        );
+        let previous = state.last_verdict;
+        state.last_verdict = Some(verdict);
+        if notify::should_notify(previous, verdict) {
+            state.pending = Some(notify::message(location, pm2_5));
+        }
+    }
+    nudge();
+}
+
+/// Muted grey while a freshly selected location is fetching. Forgets the last
+/// verdict, so the next closed reading is a new spell: a location switch should
+/// warn even if the old location was closed too (EXP17).
+pub fn set_loading(location: &str) {
+    {
+        let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        state.color = theme::MUTED;
+        state.tip = format!("AirQlality \u{00b7} {location} \u{00b7} fetching\u{2026}");
+        state.last_verdict = None;
+        // Drop any not-yet-shown warning: it names the previous location.
+        state.pending = None;
+    }
+    nudge();
+}
+
+/// Muted grey + "refreshing..." while a manual refresh is in flight (EXP22).
+///
+/// Unlike [`set_loading`] this **keeps** `last_verdict` (and any queued
+/// balloon): a refresh that finds the same closed reading is not a new closed
+/// spell, so it must not warn the user twice.
+pub fn set_refreshing(location: &str) {
+    {
+        let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        state.color = theme::MUTED;
+        state.tip = format!("AirQlality \u{00b7} {location} \u{00b7} refreshing\u{2026}");
+    }
+    nudge();
+}
+
+/// Muted grey after a fetch round that left nothing to show: not "fetching"
+/// (nothing is in flight) and not a verdict (there is none). Before EXP22 a cold
+/// start that failed left the bare `AirQlality` tip.
+pub fn set_no_data(location: &str) {
+    {
+        let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        state.color = theme::MUTED;
+        state.tip = format!("AirQlality \u{00b7} {location} \u{00b7} no data");
+    }
+    nudge();
+}
+
+/// Ask the tray thread to repaint the icon / flush a pending balloon. Safe to
+/// call before [`start`]; the thread picks up the current state when it creates
+/// the icon.
+fn nudge() {
+    let hwnd = TRAY_HWND.load(Ordering::SeqCst);
+    if hwnd != 0 {
+        unsafe {
+            let _ = PostMessageW(
+                Some(HWND(hwnd as *mut c_void)),
+                WM_TRAY_REFRESH,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+    }
+}
+
+/// What a window-close request should do (pure, so it is unit-testable).
+#[derive(Debug, PartialEq, Eq)]
+pub enum CloseAction {
+    /// Let the window close: the app is really quitting.
+    Quit,
+    /// Swallow the close and hide to the tray.
+    Hide,
+}
+
+/// Decide what to do with a close request. Quit wins when the user asked to quit
+/// or when there is no tray icon to restore the window from.
+pub fn close_action(quit_requested: bool, tray_ready: bool) -> CloseAction {
+    if quit_requested || !tray_ready {
+        CloseAction::Quit
+    } else {
+        CloseAction::Hide
+    }
+}
+
+/// The toggle menu item's label for the current window visibility.
+pub fn toggle_label(visible: bool) -> &'static str {
+    if visible {
+        "Hide"
+    } else {
+        "Show"
+    }
+}
+
+/// The flags for the "Run at startup" menu item: a native checkmark when the
+/// current executable is registered to run at login (EXP12).
+pub fn startup_menu_flags(registered: bool) -> MENU_ITEM_FLAGS {
+    if registered {
+        MF_STRING | MF_CHECKED
+    } else {
+        MF_STRING
+    }
+}
+
+/// The flags for the "Refresh" item (EXP22): greyed when no widget is
+/// listening, i.e. under the mock seams or before the real fetch loop exists.
+/// An enabled item that does nothing would be a lie.
+pub fn refresh_menu_flags(available: bool) -> MENU_ITEM_FLAGS {
+    if available {
+        MF_STRING
+    } else {
+        MF_STRING | MF_GRAYED
+    }
+}
+
+/// Called by gpui on `WM_CLOSE` (the titlebar X / Alt+F4). Returns `true` to let
+/// the window close; `false` swallows the close and hides to the tray instead.
+pub fn should_close() -> bool {
+    match close_action(
+        QUIT_REQUESTED.load(Ordering::SeqCst),
+        TRAY_READY.load(Ordering::SeqCst),
+    ) {
+        CloseAction::Quit => true,
+        CloseAction::Hide => {
+            unsafe { hide_main() };
+            false
+        }
+    }
+}
+
+/// Ask the app to quit for real: flag the close and replay it through gpui's
+/// `on_window_should_close`, which then allows the window to close.
+fn request_quit() {
+    QUIT_REQUESTED.store(true, Ordering::SeqCst);
+    let hwnd = MAIN_HWND.load(Ordering::SeqCst);
+    if hwnd != 0 {
+        unsafe {
+            let _ = PostMessageW(
+                Some(HWND(hwnd as *mut c_void)),
+                WM_CLOSE,
+                WPARAM(0),
+                LPARAM(0),
+            );
+        }
+    }
+}
+
+/// Hide the widget; it stays alive and the tray icon keeps updating.
+unsafe fn hide_main() {
+    let hwnd = MAIN_HWND.load(Ordering::SeqCst);
+    if hwnd != 0 {
+        let _ = ShowWindow(HWND(hwnd as *mut c_void), SW_HIDE);
+    }
+}
+
+/// Show and focus the widget.
+unsafe fn show_main() {
+    let hwnd = MAIN_HWND.load(Ordering::SeqCst);
+    if hwnd == 0 {
+        return;
+    }
+    let hwnd = HWND(hwnd as *mut c_void);
+    if IsWindow(Some(hwnd)).as_bool() {
+        let _ = ShowWindow(hwnd, SW_RESTORE);
+        let _ = SetForegroundWindow(hwnd);
+    }
+}
+
+/// Toggle the widget's visibility (the menu's Show/Hide item).
+unsafe fn toggle_main() {
+    let hwnd = MAIN_HWND.load(Ordering::SeqCst);
+    if hwnd == 0 {
+        return;
+    }
+    let hwnd = HWND(hwnd as *mut c_void);
+    if IsWindowVisible(hwnd).as_bool() {
+        let _ = ShowWindow(hwnd, SW_HIDE);
+    } else {
+        let _ = ShowWindow(hwnd, SW_RESTORE);
+        let _ = SetForegroundWindow(hwnd);
+    }
+}
+
+/// Pop up the tray context menu (Show/Hide, Refresh, Run at startup, Quit)
+/// at the cursor.
+unsafe fn show_menu(hwnd: HWND) {
+    let Ok(menu) = CreatePopupMenu() else {
+        return;
+    };
+    let main = MAIN_HWND.load(Ordering::SeqCst);
+    let visible = main != 0 && IsWindowVisible(HWND(main as *mut c_void)).as_bool();
+    let toggle = wide(toggle_label(visible));
+    let refresh_label = wide("Refresh");
+    let startup_label = wide("Run at startup");
+    let quit = wide("Quit");
+    let _ = AppendMenuW(menu, MF_STRING, MENU_TOGGLE as usize, PCWSTR(toggle.as_ptr()));
+    // Greyed unless the widget published its request channel (EXP22).
+    let _ = AppendMenuW(
+        menu,
+        refresh_menu_flags(refresh::available()),
+        MENU_REFRESH as usize,
+        PCWSTR(refresh_label.as_ptr()),
+    );
+    // A native checkmark shows whether we are registered for login startup.
+    let _ = AppendMenuW(
+        menu,
+        startup_menu_flags(startup::is_registered()),
+        MENU_STARTUP as usize,
+        PCWSTR(startup_label.as_ptr()),
+    );
+    let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR(std::ptr::null()));
+    let _ = AppendMenuW(menu, MF_STRING, MENU_QUIT as usize, PCWSTR(quit.as_ptr()));
+
+    let mut pt = POINT::default();
+    let _ = GetCursorPos(&mut pt);
+    // Required so the menu dismisses when the user clicks elsewhere.
+    let _ = SetForegroundWindow(hwnd);
+    let cmd = TrackPopupMenu(
+        menu,
+        TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY,
+        pt.x,
+        pt.y,
+        None,
+        hwnd,
+        None,
+    )
+    .0;
+    let _ = DestroyMenu(menu);
+    let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
+
+    match cmd as u32 {
+        MENU_TOGGLE => toggle_main(),
+        MENU_REFRESH => {
+            refresh::request();
+        }
+        MENU_STARTUP => {
+            startup::toggle();
+        }
+        MENU_QUIT => request_quit(),
+        _ => {}
+    }
+}
+
+/// Test seam: `AIRQLALITY_TRAY_QUIT_MS=<n>` triggers the same quit path the menu
+/// uses after `n` ms, so the E2E can exercise a real quit without clicking.
+fn maybe_spawn_quit_seam() {
+    let Some(ms) = std::env::var("AIRQLALITY_TRAY_QUIT_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    else {
+        return;
+    };
+    let _ = thread::Builder::new()
+        .name("airqlality-tray-quit-seam".into())
+        .spawn(move || {
+            thread::sleep(std::time::Duration::from_millis(ms));
+            request_quit();
+        });
+}
+
+/// Test seam: `AIRQLALITY_TRAY_REFRESH_MS=<n>` fires the same request the
+/// "Refresh" item does after `n` ms, so the E2E can exercise the menu path
+/// without a real right-click (EXP22).
+fn maybe_spawn_refresh_seam() {
+    let Some(ms) = std::env::var("AIRQLALITY_TRAY_REFRESH_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    else {
+        return;
+    };
+    let _ = thread::Builder::new()
+        .name("airqlality-tray-refresh-seam".into())
+        .spawn(move || {
+            thread::sleep(std::time::Duration::from_millis(ms));
+            refresh::request();
+        });
+}
+
+/// The tray thread: register a class, create the hidden window, add the icon and
+/// pump messages until the process exits.
+unsafe fn run(main_hwnd: isize) {
+    MAIN_HWND.store(main_hwnd, Ordering::SeqCst);
+
+    let hinstance = match GetModuleHandleW(None) {
+        Ok(h) => HINSTANCE(h.0),
+        Err(_) => HINSTANCE::default(),
+    };
+    let class = wide("AirQlalityTrayWindow");
+    let title = wide("AirQlality");
+
+    let wc = WNDCLASSW {
+        hInstance: hinstance,
+        lpszClassName: PCWSTR(class.as_ptr()),
+        lpfnWndProc: Some(wndproc),
+        ..Default::default()
+    };
+    RegisterClassW(&wc);
+
+    let hwnd = match CreateWindowExW(
+        WINDOW_EX_STYLE::default(),
+        PCWSTR(class.as_ptr()),
+        PCWSTR(title.as_ptr()),
+        WS_OVERLAPPED,
+        0,
+        0,
+        0,
+        0,
+        None,
+        None,
+        Some(hinstance),
+        None,
+    ) {
+        Ok(hwnd) => hwnd,
+        Err(_) => return,
+    };
+    TRAY_HWND.store(hwnd.0 as isize, Ordering::SeqCst);
+
+    add_icon(hwnd);
+
+    let mut msg = MSG::default();
+    loop {
+        // 0 = WM_QUIT, -1 = error; both end the loop.
+        let ret = GetMessageW(&mut msg, None, 0, 0).0;
+        if ret == 0 || ret == -1 {
+            break;
+        }
+        let _ = TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+}
+
+/// `NIM_ADD` the icon with the current state.
+unsafe fn add_icon(hwnd: HWND) {
+    let (color, tip) = current();
+    let icon = make_hicon(color);
+    let mut nid = base_nid(hwnd);
+    nid.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP | NIF_SHOWTIP;
+    nid.uCallbackMessage = WM_TRAY;
+    nid.hIcon = icon;
+    nid.szTip = tip_array(&tip);
+    let added = Shell_NotifyIconW(NIM_ADD, &nid).as_bool();
+    if added {
+        // Only now can a hidden window be restored from the tray.
+        TRAY_READY.store(true, Ordering::SeqCst);
+        maybe_spawn_quit_seam();
+        maybe_spawn_refresh_seam();
+        startup::maybe_toggle_seam();
+    }
+    // Version 4 makes LOWORD(lParam) the event, so clicks are decoded correctly.
+    nid.Anonymous.uVersion = NOTIFYICON_VERSION_4;
+    let _ = Shell_NotifyIconW(NIM_SETVERSION, &nid);
+    if added {
+        // The first verdict can be evaluated before the icon exists; deliver its
+        // warning now (EXP17).
+        flush_pending(hwnd);
+    }
+    let _ = DestroyIcon(icon); // the shell keeps its own copy
+    dump(color, &tip, added);
+}
+
+/// Rebuild the `HICON` from the current state and `NIM_MODIFY` it.
+unsafe fn refresh_icon(hwnd: HWND) {
+    let (color, tip) = current();
+    let icon = make_hicon(color);
+    let mut nid = base_nid(hwnd);
+    nid.uFlags = NIF_ICON | NIF_TIP | NIF_SHOWTIP;
+    nid.hIcon = icon;
+    nid.szTip = tip_array(&tip);
+    let ok = Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool();
+    let _ = DestroyIcon(icon);
+    dump(color, &tip, ok);
+    // A verdict change while the widget is hidden still reaches the user.
+    flush_pending(hwnd);
+}
+
+/// Send a queued balloon notification (`NIF_INFO`) and clear it, so it is never
+/// shown twice (EXP17). A fresh closed spell queues a new one.
+unsafe fn flush_pending(hwnd: HWND) {
+    let info = {
+        let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        state.pending.take()
+    };
+    let Some((title, body)) = info else {
+        return;
+    };
+    let mut nid = base_nid(hwnd);
+    nid.uFlags = NIF_INFO;
+    nid.szInfoTitle = title_array(&title);
+    nid.szInfo = info_array(&body);
+    // A warning that honours Focus Assist / quiet time and keeps the default
+    // notification sound.
+    nid.dwInfoFlags = NIIF_WARNING | NIIF_RESPECT_QUIET_TIME;
+    let ok = Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool();
+    dump_notify(&title, &body, ok);
+}
+
+/// `NIM_DELETE` the icon (called from `WM_DESTROY`).
+unsafe fn remove_icon(hwnd: HWND) {
+    let nid = base_nid(hwnd);
+    let _ = Shell_NotifyIconW(NIM_DELETE, &nid);
+}
+
+/// A `NOTIFYICONDATAW` with just the identity fields set.
+fn base_nid(hwnd: HWND) -> NOTIFYICONDATAW {
+    NOTIFYICONDATAW {
+        cbSize: std::mem::size_of::<NOTIFYICONDATAW>() as u32,
+        hWnd: hwnd,
+        uID: TRAY_ID,
+        uCallbackMessage: WM_TRAY,
+        ..Default::default()
+    }
+}
+
+unsafe extern "system" fn wndproc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    match msg {
+        WM_TRAY => {
+            // Version 4: LOWORD(lParam) carries the mouse event.
+            match (lparam.0 as u32) & 0xffff {
+                WM_LBUTTONUP => show_main(),
+                WM_RBUTTONUP => show_menu(hwnd),
+                _ => {}
+            }
+            LRESULT(0)
+        }
+        WM_TRAY_REFRESH => {
+            refresh_icon(hwnd);
+            LRESULT(0)
+        }
+        WM_DESTROY => {
+            remove_icon(hwnd);
+            PostQuitMessage(0);
+            LRESULT(0)
+        }
+        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+    }
+}
+
+/// Build a coloured-square `HICON` at the system small-icon size.
+unsafe fn make_hicon(color: u32) -> HICON {
+    let size = icon_size();
+    // The DIB -> HICON plumbing is shared with the app icon (`icon.rs`).
+    unsafe { crate::icon::hicon_from_bgra(&icon_bgra(color, size), size) }
+}
+
+/// System small-icon size (a crisp tray square on the primary monitor's DPI).
+unsafe fn icon_size() -> u32 {
+    let w = GetSystemMetrics(SM_CXSMICON);
+    let h = GetSystemMetrics(SM_CYSMICON);
+    w.max(h).clamp(16, 64) as u32
+}
+
+/// A copy of the desired state.
+fn current() -> (u32, String) {
+    let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    let tip = if state.tip.is_empty() {
+        "AirQlality".to_string()
+    } else {
+        state.tip.clone()
+    };
+    (state.color, tip)
+}
+
+/// A null-terminated UTF-16 buffer for the Win32 `...W` entry points.
+fn wide(s: &str) -> Vec<u16> {
+    let mut buf: Vec<u16> = s.encode_utf16().collect();
+    buf.push(0);
+    buf
+}
+
+/// A `NOTIFYICONDATAW::szTip` (128 UTF-16 code units, null-padded).
+fn tip_array(s: &str) -> [u16; 128] {
+    let mut buf = [0u16; 128];
+    for (i, unit) in s.encode_utf16().take(127).enumerate() {
+        buf[i] = unit;
+    }
+    buf
+}
+
+/// A `NOTIFYICONDATAW::szInfo` (256 UTF-16 code units, null-padded).
+fn info_array(s: &str) -> [u16; 256] {
+    let mut buf = [0u16; 256];
+    for (i, unit) in s.encode_utf16().take(255).enumerate() {
+        buf[i] = unit;
+    }
+    buf
+}
+
+/// A `NOTIFYICONDATAW::szInfoTitle` (64 UTF-16 code units, null-padded).
+fn title_array(s: &str) -> [u16; 64] {
+    let mut buf = [0u16; 64];
+    for (i, unit) in s.encode_utf16().take(63).enumerate() {
+        buf[i] = unit;
+    }
+    buf
+}
+
+/// Test seam: with `AIRQLALITY_TRAY_DUMP=<path>`, write the icon state after
+/// every `NIM_ADD`/`NIM_MODIFY` so the E2E can assert the verdict->colour wiring.
+fn dump(color: u32, tip: &str, ok: bool) {
+    let Some(path) = std::env::var_os("AIRQLALITY_TRAY_DUMP") else {
+        return;
+    };
+    let escaped = tip.replace('\\', "\\\\").replace('"', "\\\"");
+    let json = format!("{{\"color\":\"#{color:06x}\",\"tip\":\"{escaped}\",\"ok\":{ok}}}");
+    let _ = std::fs::write(path, json);
+}
+
+/// Test seam: with `AIRQLALITY_NOTIFY_DUMP=<path>`, append one JSON line per
+/// balloon actually sent, so the E2E can assert the gate fired and the shell
+/// accepted the call, at the Win32 boundary (EXP17).
+fn dump_notify(title: &str, body: &str, ok: bool) {
+    let Some(path) = std::env::var_os("AIRQLALITY_NOTIFY_DUMP") else {
+        return;
+    };
+    let esc = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+    let line = format!(
+        "{{\"verdict\":\"KEEP CLOSED\",\"title\":\"{}\",\"body\":\"{}\",\"ok\":{ok}}}\n",
+        esc(title),
+        esc(body)
+    );
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = f.write_all(line.as_bytes());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn color_matches_the_widget_palette() {
+        assert_eq!(color_for(Verdict::Open), 0x3fb950);
+        assert_eq!(color_for(Verdict::Vent), 0xd29922);
+        assert_eq!(color_for(Verdict::KeepClosed), 0xf85149);
+    }
+
+    #[test]
+    fn icon_has_a_white_border_and_a_coloured_centre() {
+        let px = icon_bgra(0x3fb950, 4);
+        assert_eq!(px.len(), 4 * 4 * 4);
+        // Top-left corner is the white border (BGRA).
+        assert_eq!(&px[0..4], &[0xff, 0xff, 0xff, 0xff]);
+        // Centre (x = 2, y = 2) is the verdict colour 0x3fb950 -> B,G,R,A.
+        let centre = (2 * 4 + 2) * 4;
+        assert_eq!(&px[centre..centre + 4], &[0x50, 0xb9, 0x3f, 0xff]);
+    }
+
+    #[test]
+    fn a_zero_size_still_yields_one_pixel() {
+        assert_eq!(icon_bgra(0, 0).len(), 4);
+    }
+
+    #[test]
+    fn close_hides_unless_quitting_or_no_tray() {
+        assert_eq!(close_action(false, true), CloseAction::Hide);
+        assert_eq!(close_action(true, true), CloseAction::Quit);
+        assert_eq!(close_action(false, false), CloseAction::Quit);
+        assert_eq!(close_action(true, false), CloseAction::Quit);
+    }
+
+    #[test]
+    fn toggle_label_reflects_visibility() {
+        assert_eq!(toggle_label(true), "Hide");
+        assert_eq!(toggle_label(false), "Show");
+    }
+
+    #[test]
+    fn startup_item_is_checked_only_when_registered() {
+        use windows::Win32::UI::WindowsAndMessaging::{MF_CHECKED, MF_STRING};
+        assert!(startup_menu_flags(true).contains(MF_CHECKED));
+        assert!(startup_menu_flags(true).contains(MF_STRING));
+        assert!(!startup_menu_flags(false).contains(MF_CHECKED));
+        assert!(startup_menu_flags(false).contains(MF_STRING));
+    }
+
+    #[test]
+    fn refresh_item_is_greyed_only_without_a_listener() {
+        use windows::Win32::UI::WindowsAndMessaging::MF_STRING;
+        assert!(refresh_menu_flags(true).contains(MF_STRING));
+        assert!(!refresh_menu_flags(true).contains(MF_GRAYED));
+        assert!(refresh_menu_flags(false).contains(MF_STRING));
+        assert!(refresh_menu_flags(false).contains(MF_GRAYED));
+    }
+
+    #[test]
+    fn a_refresh_keeps_the_verdict_and_a_loading_forgets_it() {
+        // Both states are muted, but only `set_loading` starts a new closed
+        // spell. Checked on the shared state so the notification gate (EXP17)
+        // cannot regress silently.
+        set_verdict(Verdict::KeepClosed, "Cairo, Egypt", 26.0);
+        {
+            let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+            state.pending = None; // drop the balloon this call queued
+        }
+        set_refreshing("Cairo, Egypt");
+        {
+            let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(state.color, theme::MUTED);
+            assert_eq!(state.last_verdict, Some(Verdict::KeepClosed));
+            assert!(state.pending.is_none());
+            assert!(state.tip.contains("refreshing"));
+        }
+        set_loading("Cairo, Egypt");
+        {
+            let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(state.last_verdict, None);
+        }
+    }
+}

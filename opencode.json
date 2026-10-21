@@ -1,0 +1,8 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "permissions": [
+    { "action": "external_directory", "resource": "~/.cargo/*", "effect": "allow" },
+    { "action": "read", "resource": "~/.cargo/*", "effect": "allow" },
+    { "action": "edit", "resource": "~/.cargo/*", "effect": "deny" }
+  ]
+}

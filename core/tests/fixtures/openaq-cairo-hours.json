@@ -1,0 +1,65 @@
+{
+  "meta": { "name": "openaq-api", "website": "/", "page": 1, "limit": 48, "found": ">3" },
+  "results": [
+    {
+      "value": 53.0,
+      "parameter": { "id": 2, "name": "pm25", "units": "µg/m³", "displayName": null },
+      "period": {
+        "label": "1hour",
+        "interval": "01:00:00",
+        "datetimeFrom": { "utc": "2026-10-15T04:00:00Z", "local": "2026-10-15T07:00:00+03:00" },
+        "datetimeTo": { "utc": "2026-10-15T05:00:00Z", "local": "2026-10-15T08:00:00+03:00" }
+      },
+      "sensorsId": 5550001,
+      "locationsId": 9999999
+    },
+    {
+      "value": 49.0,
+      "parameter": { "id": 2, "name": "pm25", "units": "µg/m³", "displayName": null },
+      "period": {
+        "label": "1hour",
+        "interval": "01:00:00",
+        "datetimeFrom": { "utc": "2026-10-15T05:00:00Z", "local": "2026-10-15T08:00:00+03:00" },
+        "datetimeTo": { "utc": "2026-10-15T06:00:00Z", "local": "2026-10-15T09:00:00+03:00" }
+      },
+      "sensorsId": 5550001,
+      "locationsId": 9999999
+    },
+    {
+      "value": null,
+      "parameter": { "id": 2, "name": "pm25", "units": "µg/m³", "displayName": null },
+      "period": {
+        "label": "1hour",
+        "interval": "01:00:00",
+        "datetimeFrom": { "utc": "2026-10-15T06:00:00Z", "local": "2026-10-15T09:00:00+03:00" },
+        "datetimeTo": { "utc": "2026-10-15T07:00:00Z", "local": "2026-10-15T10:00:00+03:00" }
+      },
+      "sensorsId": 5550001,
+      "locationsId": 9999999
+    },
+    {
+      "value": 38.0,
+      "parameter": { "id": 2, "name": "pm25", "units": "µg/m³", "displayName": null },
+      "period": {
+        "label": "1hour",
+        "interval": "01:00:00",
+        "datetimeFrom": { "utc": "2026-10-15T07:00:00Z", "local": "2026-10-15T10:00:00+03:00" },
+        "datetimeTo": { "utc": "2026-10-15T08:00:00Z", "local": "2026-10-15T11:00:00+03:00" }
+      },
+      "sensorsId": 5550001,
+      "locationsId": 9999999
+    },
+    {
+      "value": 41.5,
+      "parameter": { "id": 2, "name": "pm25", "units": "µg/m³", "displayName": null },
+      "period": {
+        "label": "1hour",
+        "interval": "01:00:00",
+        "datetimeFrom": { "utc": "2026-10-15T08:00:00Z", "local": "2026-10-15T11:00:00+03:00" },
+        "datetimeTo": { "utc": "2026-10-15T09:00:00Z", "local": "2026-10-15T12:00:00+03:00" }
+      },
+      "sensorsId": 5550001,
+      "locationsId": 9999999
+    }
+  ]
+}

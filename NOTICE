@@ -1,0 +1,49 @@
+# NOTICE
+
+AirQlality is licensed under the MIT License (see `LICENSE`). That covers the
+source code in this repository.
+
+The source code **carries data and derived data from third parties**, which
+keep their own terms. The full, itemised record is
+[`core/assets/ATTRIBUTION.md`](core/assets/ATTRIBUTION.md); this file is the
+top-level summary required when redistributing the app or its assets.
+
+## Bundled data
+
+| File | Origin | Licence |
+|---|---|---|
+| `core/assets/cities.json`, `core/assets/countries.json` | [GeoNames](https://www.geonames.org/) `cities15000` and `countryInfo` dumps, converted by `experiments/EXP08/make_cities.ps1` | [CC BY 4.0](https://creativecommons.org/licenses/by/4.0/) |
+| `core/assets/noise_density.json` | Derived from the [Global Roads Inventory Project (GRIP4)](https://www.globio.info/download-grip-dataset) road-density rasters, sampled per city by `experiments/EXP16/make_noise_density.py` | [ODbL 1.0](https://opendatacommons.org/licenses/odbl/1-0/) |
+
+`noise_density.json` is a **Derivative Database** under the ODbL: it is
+distributed under the ODbL, and the MIT licence above does not replace that.
+The code that reads it stays MIT.
+
+Please cite GRIP4 as: Meijer et al. (2018), *Global patterns of current and
+future road infrastructure*, Environ. Res. Lett. 13 064006,
+<https://doi.org/10.1088/1748-9326/aabd42>.
+
+## Live data sources
+
+The widget fetches data at runtime; nothing from these is bundled.
+
+- **Open-Meteo Air Quality** (<https://open-meteo.com/>) - data provided by the
+  **Copernicus Atmosphere Monitoring Service (CAMS) ENSEMBLE**, CC BY 4.0.
+  Attribution to both CAMS and Open-Meteo is required and shown in the app's
+  header.
+- **OpenAQ** (<https://openaq.org/>) - ground-station measurements; CC BY 4.0,
+  with the per-station provider attribution returned by the API being
+  authoritative.
+- **OpenWeatherMap Air Pollution** (<https://openweathermap.org/api/air-pollution>)
+  - used under the OpenWeatherMap terms of service as a second model forecast.
+- **GeoNames** city search is also used through the bundled asset above.
+
+The noise curve is a **model estimate** from GRIP4 road density and a documented
+diurnal profile, not a measurement, and the app labels it as such.
+
+## Dependencies
+
+Rust crate licences are recorded in `Cargo.lock`; the crates are fetched from
+crates.io at build time and are not vendored here. Notable ones: `gpui-ce`
+(Apache-2.0), `ureq`, `native-tls`, `serde`, `chrono`, `windows` (MIT OR
+Apache-2.0), `image`.

@@ -1,0 +1,216 @@
+{
+  "root": "n",
+  "gpui_focus": "d",
+  "active_descendant_focus": null,
+  "frame": {
+    "rendered_at": "2026-10-04T21:57:21.281+03:00",
+    "frame_number": 1,
+    "window_title": "AirQlality — open-window widget",
+    "node_count": 14,
+    "tab_stop_count": 2,
+    "viewport_size": {
+      "width": 560.0,
+      "height": 340.0
+    },
+    "scale_factor": 1.25
+  },
+  "nodes": {
+    "a": {
+      "accesskit_id": "6934255220797986231",
+      "element_id": "Name(\"verdict-status\")",
+      "view": "airqlality::ui::Widget",
+      "source_location": "app\\src\\ui.rs:422:31",
+      "aria": {
+        "role": "Label",
+        "label": "KEEP CLOSED"
+      }
+    },
+    "b": {
+      "accesskit_id": "15758235619783375051",
+      "element_id": "Name(\"location-trigger\")",
+      "view": "airqlality::ui::Widget",
+      "source_location": "app\\src\\ui.rs:452:17",
+      "aria": {
+        "role": "Button",
+        "on_action": [
+          "Click",
+          "Focus"
+        ],
+        "label": "Change location",
+        "keyboard_shortcut": "Ctrl+K",
+        "expanded": true
+      }
+    },
+    "c": {
+      "accesskit_id": "10724062588713542678",
+      "element_id": "Name(\"timeline\")",
+      "view": "airqlality::ui::Widget",
+      "source_location": "app\\src\\ui.rs:825:5",
+      "aria": {
+        "role": "Image",
+        "label": "Air quality timeline for Sanaa, Yemen. Now PM2.5 26 micrograms per cubic metre. Best window 02:00 to 06:00 (5 hours)."
+      }
+    },
+    "d": {
+      "accesskit_id": "4967683696065290556",
+      "element_id": "Name(\"location-search\")",
+      "view": "airqlality::ui::Widget",
+      "source_location": "app\\src\\ui.rs:500:21",
+      "aria": {
+        "role": "TextInput",
+        "on_action": [
+          "Focus"
+        ],
+        "label": "Search a city",
+        "value": "san",
+        "placeholder": "Search a city…"
+      }
+    },
+    "e": {
+      "accesskit_id": "3547656751009228506",
+      "element_id": "NamedInteger(\"location-row\", 0)",
+      "view": "airqlality::ui::Widget",
+      "source_location": "app\\src\\ui.rs:556:29",
+      "aria": {
+        "role": "ListItem",
+        "on_action": [
+          "Click"
+        ],
+        "label": "Santiago, Chile",
+        "selected": true
+      }
+    },
+    "f": {
+      "accesskit_id": "8152118667087592379",
+      "element_id": "NamedInteger(\"location-row\", 1)",
+      "view": "airqlality::ui::Widget",
+      "source_location": "app\\src\\ui.rs:556:29",
+      "aria": {
+        "role": "ListItem",
+        "on_action": [
+          "Click"
+        ],
+        "label": "Santo Domingo, Dominican Republic",
+        "selected": false
+      }
+    },
+    "g": {
+      "accesskit_id": "11541993346831792120",
+      "element_id": "NamedInteger(\"location-row\", 2)",
+      "view": "airqlality::ui::Widget",
+      "source_location": "app\\src\\ui.rs:556:29",
+      "aria": {
+        "role": "ListItem",
+        "on_action": [
+          "Click"
+        ],
+        "label": "Sanaa, Yemen",
+        "selected": true
+      }
+    },
+    "h": {
+      "accesskit_id": "15026006368217108560",
+      "element_id": "NamedInteger(\"location-row\", 3)",
+      "view": "airqlality::ui::Widget",
+      "source_location": "app\\src\\ui.rs:556:29",
+      "aria": {
+        "role": "ListItem",
+        "on_action": [
+          "Click"
+        ],
+        "label": "Santa Cruz de la Sierra, Bolivia",
+        "selected": false
+      }
+    },
+    "i": {
+      "accesskit_id": "14694287506531562698",
+      "element_id": "NamedInteger(\"location-row\", 4)",
+      "view": "airqlality::ui::Widget",
+      "source_location": "app\\src\\ui.rs:556:29",
+      "aria": {
+        "role": "ListItem",
+        "on_action": [
+          "Click"
+        ],
+        "label": "Santiago de Querétaro, Mexico",
+        "selected": false
+      }
+    },
+    "j": {
+      "accesskit_id": "15064850384925680030",
+      "element_id": "NamedInteger(\"location-row\", 5)",
+      "view": "airqlality::ui::Widget",
+      "source_location": "app\\src\\ui.rs:556:29",
+      "aria": {
+        "role": "ListItem",
+        "on_action": [
+          "Click"
+        ],
+        "label": "San Antonio, United States",
+        "selected": false
+      }
+    },
+    "k": {
+      "accesskit_id": "16469632149283016483",
+      "element_id": "NamedInteger(\"location-row\", 6)",
+      "view": "airqlality::ui::Widget",
+      "source_location": "app\\src\\ui.rs:556:29",
+      "aria": {
+        "role": "ListItem",
+        "on_action": [
+          "Click"
+        ],
+        "label": "San Diego, United States",
+        "selected": false
+      }
+    },
+    "l": {
+      "accesskit_id": "15426487815008647824",
+      "element_id": "NamedInteger(\"location-row\", 7)",
+      "view": "airqlality::ui::Widget",
+      "source_location": "app\\src\\ui.rs:556:29",
+      "aria": {
+        "role": "ListItem",
+        "on_action": [
+          "Click"
+        ],
+        "label": "Santiago de los Caballeros, Dominican Republic",
+        "selected": false
+      }
+    },
+    "m": {
+      "accesskit_id": "4591901311498252087",
+      "children": [
+        "e",
+        "f",
+        "g",
+        "h",
+        "i",
+        "j",
+        "k",
+        "l"
+      ],
+      "element_id": "Name(\"location-results-box\")",
+      "view": "airqlality::ui::Widget",
+      "source_location": "app\\src\\ui.rs:586:13",
+      "aria": {
+        "role": "ListBox",
+        "label": "Search results"
+      }
+    },
+    "n": {
+      "accesskit_id": "0",
+      "children": [
+        "a",
+        "b",
+        "c",
+        "d",
+        "m"
+      ],
+      "aria": {
+        "role": "Window",
+        "label": "AirQlality — open-window widget"
+      }
+    }
+  }
+}

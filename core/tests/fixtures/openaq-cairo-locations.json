@@ -1,0 +1,54 @@
+{
+  "meta": { "name": "openaq-api", "website": "/", "page": 1, "limit": 100, "found": 3 },
+  "results": [
+    {
+      "id": 1621200,
+      "name": "Cairo",
+      "locality": "N/A",
+      "timezone": "Africa/Cairo",
+      "country": { "id": 162, "code": "EG", "name": "Egypt" },
+      "provider": { "id": 119, "name": "AirNow" },
+      "isMobile": false,
+      "isMonitor": true,
+      "sensors": [
+        { "id": 7041505, "name": "pm25 µg/m³", "parameter": { "id": 2, "name": "pm25", "units": "µg/m³", "displayName": "PM2.5" } }
+      ],
+      "coordinates": { "latitude": 30.04147, "longitude": 31.23289 },
+      "datetimeLast": {
+        "utc": "2025-03-04T12:00:00Z",
+        "local": "2025-03-04T14:00:00+02:00"
+      }
+    },
+    {
+      "id": 9999999,
+      "name": "Walkthru Earth Main",
+      "locality": "N/A",
+      "timezone": "Africa/Cairo",
+      "country": { "id": 162, "code": "EG", "name": "Egypt" },
+      "isMobile": false,
+      "isMonitor": false,
+      "sensors": [
+        { "id": 5550001, "name": "pm25 µg/m³", "parameter": { "id": 2, "name": "pm25", "units": "µg/m³", "displayName": "PM2.5" } }
+      ],
+      "coordinates": { "latitude": 30.099407670574287, "longitude": 31.63850168272893 },
+      "datetimeLast": {
+        "utc": "2026-10-15T07:00:00Z",
+        "local": "2026-10-15T10:00:00+03:00"
+      }
+    },
+    {
+      "id": 8888888,
+      "name": "Cairo - Giza (NO2 only)",
+      "isMobile": false,
+      "isMonitor": true,
+      "sensors": [
+        { "id": 333001, "name": "no2 ppm", "parameter": { "id": 7, "name": "no2", "units": "ppm", "displayName": "NO₂" } }
+      ],
+      "coordinates": { "latitude": 30.0131, "longitude": 31.2089 },
+      "datetimeLast": {
+        "utc": "2026-10-15T07:00:00Z",
+        "local": "2026-10-15T10:00:00+03:00"
+      }
+    }
+  ]
+}
