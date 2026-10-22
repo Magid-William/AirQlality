@@ -66,6 +66,15 @@ function Get-ArpEntry {
     }
 }
 
+# A hosted runner's %TEMP% is an 8.3 short path (`...\RUNNER~1\...`) while the
+# shortcut and the registry store the long one, so compare canonical paths - not
+# the strings this script happens to hold.
+function Get-LongPath([string]$p) {
+    if (-not $p -or -not (Test-Path $p)) { return $p }
+    try { return (New-Object -ComObject Scripting.FileSystemObject).GetFile($p).Path }
+    catch { return $p }
+}
+
 # ---------------------------------------------------------------- install (x2)
 # Twice on purpose: the second run is the in-place upgrade path (same AppId,
 # same directory) and must not stack a second entry or shortcut.
@@ -90,7 +99,8 @@ Check 'Start Menu shortcut exists' (Test-Path $startMenu) $startMenu
 if (Test-Path $startMenu) {
     $shell = New-Object -ComObject WScript.Shell
     $target = $shell.CreateShortcut($startMenu).TargetPath
-    Check 'Start Menu shortcut points at the installed exe' ($target -eq $exe) $target
+    $same = (Get-LongPath $target) -ieq (Get-LongPath $exe)
+    Check 'Start Menu shortcut points at the installed exe' $same $target
 }
 $desktop = Join-Path ([Environment]::GetFolderPath('Desktop')) 'AirQlality.lnk'
 Check 'the desktop icon is opt-in (absent)' (-not (Test-Path $desktop)) $desktop
