@@ -97,6 +97,13 @@ value survives it, or the setup cannot be produced in CI without a human.
 _Pending._
 
 ## Learnings
+- A hosted runner's `%TEMP%` is an **8.3 short path** (`C:\Users\RUNNER~1\...`)
+  while shortcuts and the registry keep the long one: never compare raw path
+  strings, and don't trust `FileSystemObject.GetFile().Path` either (it threw on
+  the runner and the silent fallback hid it). The proof compares what the target
+  *is*: leaf `airqlality.exe`, inside this run's scratch id, and a SHA-256 equal to
+  the installed exe. This was the only failing assertion in the first two `v0.3.0`
+  runs - the installer itself was correct both times.
 - Inno Setup is **not** on the `windows-2025` runner image (it was on 2022):
   `choco install innosetup --no-progress -y` then use
   `C:\Program Files (x86)\Inno Setup 6\ISCC.exe`. `winget install

@@ -34,7 +34,8 @@ function Check([string]$what, [bool]$ok, [string]$detail = "") {
 }
 
 $setupPath = (Resolve-Path $Setup).Path
-$root = Join-Path $env:TEMP ("airqlality-install-proof-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+$proofId = [guid]::NewGuid().ToString('N').Substring(0, 8)
+$root = Join-Path $env:TEMP ("airqlality-install-proof-" + $proofId)
 $dir = Join-Path $root 'app'
 $startMenu = Join-Path $env:APPDATA 'Microsoft\Windows\Start Menu\Programs\AirQlality.lnk'
 $runKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run'
@@ -67,13 +68,8 @@ function Get-ArpEntry {
 }
 
 # A hosted runner's %TEMP% is an 8.3 short path (`...\RUNNER~1\...`) while the
-# shortcut and the registry store the long one, so compare canonical paths - not
-# the strings this script happens to hold.
-function Get-LongPath([string]$p) {
-    if (-not $p -or -not (Test-Path $p)) { return $p }
-    try { return (New-Object -ComObject Scripting.FileSystemObject).GetFile($p).Path }
-    catch { return $p }
-}
+# shortcut stores the long one, so never compare path *spellings*: see the
+# shortcut check below.
 
 # ---------------------------------------------------------------- install (x2)
 # Twice on purpose: the second run is the in-place upgrade path (same AppId,
@@ -99,8 +95,17 @@ Check 'Start Menu shortcut exists' (Test-Path $startMenu) $startMenu
 if (Test-Path $startMenu) {
     $shell = New-Object -ComObject WScript.Shell
     $target = $shell.CreateShortcut($startMenu).TargetPath
-    $same = (Get-LongPath $target) -ieq (Get-LongPath $exe)
-    Check 'Start Menu shortcut points at the installed exe' $same $target
+    # Compare what the target *is* rather than how it is spelled (8.3 vs long
+    # path): named airqlality.exe, inside this run's scratch directory, and
+    # byte-identical to the exe the installer placed there.
+    $sameName = (Split-Path $target -Leaf) -eq 'airqlality.exe'
+    $inProof = $target -like "*$proofId*"
+    $sameBytes = $false
+    if ($sameName -and (Test-Path $target)) {
+        $sameBytes = (Get-FileHash $target -Algorithm SHA256).Hash -eq
+                     (Get-FileHash $exe -Algorithm SHA256).Hash
+    }
+    Check 'Start Menu shortcut points at the installed exe' ($sameName -and $inProof -and $sameBytes) $target
 }
 $desktop = Join-Path ([Environment]::GetFolderPath('Desktop')) 'AirQlality.lnk'
 Check 'the desktop icon is opt-in (absent)' (-not (Test-Path $desktop)) $desktop
