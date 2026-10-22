@@ -1,6 +1,6 @@
 # EXP29 - a per-user Windows installer next to the zip
 
-**Status:** `inProg` (started 2026-10-22).
+**Status:** `success` (user, 2026-10-22).
 
 ## Summary
 Ship `AirQlality-v<version>-windows-x64-setup.exe` (Inno Setup, per-user, no
@@ -98,64 +98,49 @@ value survives it, or the setup cannot be produced in CI without a human.
   auto-updater in this experiment. *(Assumption adopted.)*
 
 ## Conclusion (findings)
-_Pending._
+**Success (user, 2026-10-22).** One Inno Setup script turns the single exe into
+an installer that behaves like the app: per-user, no admin, no runtime. It is
+published as `v0.3.0` and every claim below is asserted by
+`installer/proof.ps1` (28 checks), which the `Release` workflow runs against the
+setup it just built, *before* uploading it.
 
-## Learnings
-- A hosted runner's `%TEMP%` is an **8.3 short path** (`C:\Users\RUNNER~1\...`)
-  while shortcuts and the registry keep the long one: never compare raw path
-  strings, and don't trust `FileSystemObject.GetFile().Path` either (it threw on
-  the runner and the silent fallback hid it). The proof compares what the target
-  *is*: leaf `airqlality.exe`, inside this run's scratch id, and a SHA-256 equal to
-  the installed exe. This was the only failing assertion in the first two `v0.3.0`
-  runs - the installer itself was correct both times.
-- Inno Setup is **not** on the `windows-2025` runner image (it was on 2022):
-  `choco install innosetup --no-progress -y` then use
-  `C:\Program Files (x86)\Inno Setup 6\ISCC.exe`. `winget install
-  JRSoftware.InnoSetup` on a dev box lands in
-  `%LOCALAPPDATA%\Programs\Inno Setup 6\` instead - search both.
-- `ISCC.exe /DAppVersion=<ver> /DSourceExe=<exe> /DSourceIcon=<ico> <script>.iss`
-  - use when building the setup; `#ifndef` defaults in the script keep a bare
-  `cargo build --release` tree working.
-- `UninstallDisplayName` is what Add/Remove Programs shows; without it Inno uses
-  `AppVerName` (`AirQlality 0.2.0-test`) and the ARP key is
-  `HKCU\...\Uninstall\{AppId}_is1`. Enumerate by `DisplayName`, not by path.
-- `PrivilegesRequired=lowest` really means no UAC: `elevated=False`, install to a
-  scratch dir, uninstall, all silent (`/VERYSILENT /SUPPRESSMSGBOXES
-  /NORESTART /DIR=...`).
-- Silent installs skip `unchecked` tasks: the opt-in desktop icon stays absent
-  under `/VERYSILENT` (three consecutive proof runs), so the silent proof does
-  not create desktop clutter.
-- The Inno uninstaller copies itself to `%TEMP%` and **returns immediately**:
-  `Start-Process -Wait` proves nothing - poll for the exe to disappear.
-- The setup's icon must be a file, and the EXP14 `.ico` only exists in
-  `OUT_DIR`: `cargo run --example emit_icon -- target\AirQlality.ico` writes the
-  same bytes; check it landed with `ExtractAssociatedIcon(...).ToBitmap()` and
-  sample the four quadrant pixels.
-- `app/tests/capture.ps1` cannot screenshot the installer: the wizard lives in a
-  child `.tmp` process (the started exe is only the extractor) with window class
-  `TWizardForm`, so find it with `EnumWindows` + class + title
-  (`experiments/EXP29/capture-setup.ps1`).
-- Silent upgrade over a **running** tray app failed with **exit 5** until setup
-  stopped it itself: `CloseApplications=yes` (Restart Manager) cannot close an
-  app that treats `WM_CLOSE` as "hide to the tray". Fix: `[Files]` entry with
-  `Flags: dontcopy` + `ExtractTemporaryFile` + `Exec(powershell -File stop-app.ps1
-  -Path "{app}\airqlality.exe")` in `PrepareToInstall`, matching on the process
-  `Path` so a portable copy elsewhere is untouched. Use when packaging any
-  tray/hide-on-close app.
-- On this box MinGW is `%LOCALAPPDATA%\mingw64\bin`, **not** `C:\mingw64\bin`; a
-  background shell did not inherit it and a fresh link died with
-  `ld: cannot find -lktmw32`. Set it explicitly:
-  `$env:PATH = "$env:LOCALAPPDATA\mingw64\bin;$env:PATH"` before
-  `cargo build`/`test`.
+What landed:
+- `installer/airqlality.iss`: Inno Setup 6, `PrivilegesRequired=lowest`,
+  `%LocalAppData%\Programs\AirQlality`, stable `AppId` (one Add/Remove Programs
+  entry across versions), version from the tag, the EXP14 icon on the setup and
+  the ARP entry, Start Menu shortcut, opt-in desktop shortcut, opt-in "launch
+  now", `MinVersion` 10.0.18362 (the README's promise).
+- `installer/stop-app.ps1` + `PrepareToInstall`: an upgrade replaces the exe
+  while the widget is in the tray. Restart Manager cannot do this (the widget
+  hides on `WM_CLOSE`, EXP11, so setup died with **exit 5**); setup now stops only
+  the copy running from `{app}\airqlality.exe` and leaves a portable copy alone.
+- `installer/proof.ps1`: silent install/upgrade/uninstall with 28 assertions -
+  exe, shortcut target, ARP name/version/icon, one entry after an upgrade,
+  upgrade over a running widget, portable copy untouched, uninstall leaving no
+  exe/shortcut/entry/autostart value, settings kept.
+- `app/examples/emit_icon.rs`: the icon only existed in `OUT_DIR`, and Inno wants
+  a file - the example reuses `icon_design::encode_ico`, so setup, exe and
+  window icon cannot drift.
+- `release.yml`: installs Inno on the runner (absent from `windows-2025`), builds
+  the setup from the `dist` exe, gates the upload on the proof, and hashes both
+  assets; README offers the installer first and the zip as the portable option.
+- `v0.3.0` published: setup **9.9 MiB**, zip **12.5 MiB** for the same 32.6 MiB
+  exe - the installer is the smaller download, because lzma2/max beats deflate.
 
-## Still open when the session stopped (2026-10-22)
+Limits / not proven:
+- Unsigned: SmartScreen warns once (`More info -> Run anyway`), documented. No
+  `SignTool` name is configured, so adding a certificate is a one-line change
+  later; no MSI, no per-machine install, no auto-update.
+- The proof is a silent-install proof. The wizard itself is only screenshotted at
+  the licence page (`EXP29-setup.png`); nobody clicked Next/Install by hand.
+- Upgrading stops the widget and does not restart it (silent installs stay
+  silent); uninstall always keeps `%APPDATA%\AirQlality` and gives no prompt.
 - One unproven one-off: the very first proof run found a desktop shortcut even
-  though the task is `unchecked`; every later run (many installs, including
-  upgrades) never created one. Suspected stale artifact, not reproduced.
-- Restart after an upgrade: setup stops the running widget and does not start it
-  again unless the user asks on the finish page (silent installs stay silent).
-- Signed installers: no certificate, so SmartScreen warns; `SignTool` hooks are
-  left out on purpose until there is a cert.
+  though the task is `unchecked`; every later run (many installs and upgrades)
+  never created one. Suspected stale artifact, never reproduced.
+- The published setup was also installed and launched here, from the downloaded
+  `dist` exe (`EXP29-released-widget.png`) - the same proof, 28/28, SHA-256
+  re-checked against `SHA256SUMS.txt`.
 
 ## Release
 `v0.3.0` published on 2026-10-22 after the `Release` workflow's own 28/28 proof
@@ -164,3 +149,36 @@ _Pending._
 the shortcut target compared as a path string against the runner's 8.3 `%TEMP%` -
 so the tag was deleted and re-pushed twice; the installer build and proof were
 green apart from that assertion both times.
+
+## Learnings
+- Inno Setup is not on the `windows-2025` image (it was on 2022):
+  `choco install innosetup --no-progress -y`, ISCC at
+  `C:\Program Files (x86)\Inno Setup 6\ISCC.exe`; `winget install
+  JRSoftware.InnoSetup` on a dev box lands in `%LocalAppData%\Programs\Inno Setup
+  6\`. Search both paths.
+- `ISCC /DAppVersion=<ver> /DSourceExe=<exe> /DSourceIcon=<ico> installer\airqlality.iss`
+  builds the setup; `#ifndef` defaults keep a bare `cargo build --release` tree
+  working. `UninstallDisplayName` is what ARP shows (otherwise `AppVerName`), and
+  the ARP key is `HKCU\...\Uninstall\{AppId}_is1` - find it by `DisplayName`.
+- `PrivilegesRequired=lowest` + `/VERYSILENT /SUPPRESSMSGBOXES /NORESTART
+  /DIR=...` proves a no-UAC install from a non-elevated shell, and silent
+  installs skip `unchecked` tasks (no desktop icon).
+- The Inno uninstaller re-execs itself from `%TEMP%` and returns at once:
+  `Start-Process -Wait` proves nothing, poll for the exe to disappear.
+- A tray/hide-on-close app cannot be upgraded with `CloseApplications=yes`: RM's
+  close hides the window instead of ending it (setup exit 5). Ship `[Files]
+  Flags: dontcopy` + `ExtractTemporaryFile` + `Exec(powershell -File stop.ps1)`
+  in `PrepareToInstall`, matching the process `Path` so other copies survive.
+- Never compare paths with a hosted runner: `%TEMP%` is 8.3 (`RUNNER~1`) while
+  shortcuts store the long form, and `FileSystemObject.GetFile().Path` can throw
+  (a silent fallback hides it). Assert identity instead - leaf name, a per-run
+  id, and equal SHA-256.
+- The `.ico` the app embeds lives in `OUT_DIR`; `cargo run --example emit_icon --
+  target\AirQlality.ico` writes the same bytes, and
+  `ExtractAssociatedIcon(..).ToBitmap()` + quadrant pixels proves Inno picked it
+  up. The setup wizard is a child `.tmp` process (window class `TWizardForm`), so
+  `app/tests/capture.ps1` cannot screenshot it - use `EnumWindows` by class+title
+  (`experiments/EXP29/capture-setup.ps1`).
+- MinGW on this box is `%LOCALAPPDATA%\mingw64\bin`, not `C:\mingw64\bin`; a
+  background shell does not inherit it and a fresh link dies with
+  `ld: cannot find -lktmw32`.
