@@ -77,6 +77,9 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 
 [Files]
 Source: "{#SourceExe}"; DestDir: "{app}"; DestName: "{#AppExeName}"; Flags: ignoreversion
+; Not installed: extracted to {tmp} only when an upgrade has to stop a running
+; copy (see PrepareToInstall below).
+Source: "stop-app.ps1"; DestDir: "{tmp}"; Flags: dontcopy
 
 [Icons]
 Name: "{autoprograms}\{#AppName}"; Filename: "{app}\{#AppExeName}"
@@ -88,6 +91,33 @@ Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; Tasks: deskto
 Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
 
 [Code]
+// An upgrade must work while the widget sits in the tray - which is how it is
+// normally running. `CloseApplications=yes` (above) is not enough: Restart
+// Manager asks windows to close and the widget treats that as "hide to the tray"
+// (EXP11), so setup fails with exit code 5 / "files in use". So stop *this*
+// install's copy explicitly before any file is replaced. A portable copy running
+// from another directory is left alone.
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  ResultCode: Integer;
+begin
+  Result := '';
+  if not FileExists(ExpandConstant('{app}\{#AppExeName}')) then
+    Exit;
+  ExtractTemporaryFile('stop-app.ps1');
+  if not Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+      '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' +
+      ExpandConstant('{tmp}\stop-app.ps1') + '" -Path "' +
+      ExpandConstant('{app}\{#AppExeName}') + '"',
+      '', SW_HIDE, ewWaitUntilTerminated, ResultCode) then
+  begin
+    Result := 'AirQlality could not be stopped before the upgrade. Quit it from the tray menu (Quit) and run the setup again.';
+    Exit;
+  end;
+  if ResultCode <> 0 then
+    Result := 'AirQlality is still running. Quit it from the tray menu (Quit) and run the setup again.';
+end;
+
 // No [UninstallDelete]: only what the installer created is removed (the exe and
 // the shortcuts Inno tracks). User settings live in %APPDATA%\AirQlality - API
 // keys, the chosen location, the notify choices - and survive on purpose.

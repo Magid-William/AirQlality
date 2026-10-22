@@ -38,6 +38,11 @@ value survives it, or the setup cannot be produced in CI without a human.
      icon task, optional "launch now" on the finish page, `[Code]`
      `CurUninstallStepChanged` deleting the `HKCU\...\Run` value, and
      `UninstallDelete` leaving `%APPDATA%\AirQlality` alone.
+  2b. `installer/stop-app.ps1` + `PrepareToInstall`: the widget hides to the tray
+     on `WM_CLOSE` (EXP11), so Restart Manager cannot end it and a silent upgrade
+     over a running copy died with **exit 5**. Setup now extracts this script to
+     `{tmp}` and stops only the copy running from `{app}\airqlality.exe` before
+     replacing it; a portable copy elsewhere keeps running.
   3. `.github/workflows/release.yml`: install Inno Setup on the runner (not
      preinstalled on `windows-2025`), build the setup from the `dist` exe,
      upload it next to the zip, and hash **both** in `SHA256SUMS.txt`.
@@ -53,10 +58,12 @@ value survives it, or the setup cannot be produced in CI without a human.
   extracted icon: `#f85149` / `#d29922` / `#3fb950` / `#8b949e` in the four
   quadrants), `EXP29-installed-widget.png` (the widget launched from the
   installed `%LOCALAPPDATA%\Programs\AirQlality` path, mock source, KEEP CLOSED),
-  `EXP29-proof.log` (22 assertions, `RESULT PASS`, run from a **non-elevated**
-  shell: `elevated=False`). The setup is **9.9 MiB** from the 32.6 MiB exe
-  (lzma2/max), vs a 33 MB zip. Suites: core 64/64, app 82/82, windowed E2E 33/33
-  in 276 s - no product code changed, so no re-baseline.
+  `EXP29-proof.log` (28 assertions, `RESULT PASS`, run from a **non-elevated**
+  shell: `elevated=False`) - including an upgrade over a running widget (setup
+  exit 0, the running copy closed, a portable copy left alone). The setup is
+  **10.1 MiB** from the 32.6 MiB exe (lzma2/max), vs a 33 MB zip. Suites: core
+  64/64, app 82/82, windowed E2E 33/33 in 276 s - no product code changed, so no
+  re-baseline.
 - **May touch:** `installer/airqlality.iss` (new), `app/examples/emit_icon.rs`
   (new), `experiments/EXP29/**`, `.github/workflows/release.yml`,
   `.gitignore`, `README.md`, `experiments-overview.md`, branch `EXP29`.
@@ -117,6 +124,13 @@ _Pending._
   child `.tmp` process (the started exe is only the extractor) with window class
   `TWizardForm`, so find it with `EnumWindows` + class + title
   (`experiments/EXP29/capture-setup.ps1`).
+- Silent upgrade over a **running** tray app failed with **exit 5** until setup
+  stopped it itself: `CloseApplications=yes` (Restart Manager) cannot close an
+  app that treats `WM_CLOSE` as "hide to the tray". Fix: `[Files]` entry with
+  `Flags: dontcopy` + `ExtractTemporaryFile` + `Exec(powershell -File stop-app.ps1
+  -Path "{app}\airqlality.exe")` in `PrepareToInstall`, matching on the process
+  `Path` so a portable copy elsewhere is untouched. Use when packaging any
+  tray/hide-on-close app.
 - On this box MinGW is `%LOCALAPPDATA%\mingw64\bin`, **not** `C:\mingw64\bin`; a
   background shell did not inherit it and a fresh link died with
   `ld: cannot find -lktmw32`. Set it explicitly:
@@ -124,10 +138,10 @@ _Pending._
   `cargo build`/`test`.
 
 ## Still open when the session stopped (2026-10-22)
-- Upgrade over a **running** tray app: `CloseApplications=yes` is in the script,
-  but no proof run had the widget running during the second install.
 - One unproven one-off: the very first proof run found a desktop shortcut even
-  though the task is `unchecked`; three later runs (six installs) never created
-  one. Suspected stale artifact, not reproduced.
+  though the task is `unchecked`; every later run (many installs, including
+  upgrades) never created one. Suspected stale artifact, not reproduced.
 - The published asset itself: `dist` exe + setup are built and proven on CI, so
   the first tagged release after this branch is the real end-to-end check.
+- Restart after an upgrade: setup stops the running widget and does not start it
+  again unless the user asks on the finish page (silent installs stay silent).

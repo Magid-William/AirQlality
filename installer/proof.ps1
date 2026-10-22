@@ -124,6 +124,42 @@ if ($PngOut) {
     Check 'the screenshot was written' (Test-Path $PngOut) $PngOut
 }
 
+# --------------------------------------- upgrade over a running tray app (EXP29)
+# The real-world update path: the widget is running (hidden in the tray), the user
+# runs the new setup. `CloseApplications=yes` must close it instead of failing on
+# the locked exe. Mock seams only: no network, no wait for real data.
+$env:AIRQLALITY_SOURCE = 'mock'
+$env:AIRQLALITY_FREEZE_NOW = '1'
+$running = Start-Process -FilePath $exe -PassThru
+$deadline = (Get-Date).AddSeconds(15)
+while ($running.MainWindowHandle -eq 0 -and -not $running.HasExited -and (Get-Date) -lt $deadline) {
+    Start-Sleep -Milliseconds 250
+    $running.Refresh()
+}
+Check 'the widget is running before the upgrade' (-not $running.HasExited) "pid=$($running.Id)"
+# A portable copy running from *another* directory belongs to the user, not to
+# this install: the upgrade must not touch it.
+$portable = Join-Path $root 'portable'
+New-Item -ItemType Directory -Force -Path $portable | Out-Null
+Copy-Item $exe (Join-Path $portable 'airqlality.exe')
+$portableProc = Start-Process -FilePath (Join-Path $portable 'airqlality.exe') -PassThru
+Start-Sleep -Seconds 2
+$code = Invoke-Setup $setupPath (Join-Path $root 'install-running.log')
+$deadline = (Get-Date).AddSeconds(30)
+while (-not $running.HasExited -and (Get-Date) -lt $deadline) {
+    Start-Sleep -Milliseconds 250
+    $running.Refresh()
+}
+Check 'the upgrade succeeds while the app runs' ($code -eq 0) "exit=$code"
+Check 'the upgrade closes the running app' ($running.HasExited)
+$portableProc.Refresh()
+Check 'the upgrade leaves a portable copy alone' (-not $portableProc.HasExited)
+Check 'the upgrade leaves a working exe' (Test-Path $exe)
+Check 'the running upgrade keeps one Add/Remove Programs entry' (@(Get-ArpEntry).Count -eq 1)
+if (-not $running.HasExited) { Stop-Process -Id $running.Id -Force -ErrorAction SilentlyContinue }
+if (-not $portableProc.HasExited) { Stop-Process -Id $portableProc.Id -Force -ErrorAction SilentlyContinue }
+Remove-Item Env:AIRQLALITY_SOURCE, Env:AIRQLALITY_FREEZE_NOW
+
 # ------------------------------------------------------------------- uninstall
 $unins = Join-Path $dir 'unins000.exe'
 Check 'the uninstaller was installed' (Test-Path $unins) $unins
