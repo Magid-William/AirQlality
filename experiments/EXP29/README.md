@@ -60,10 +60,14 @@ value survives it, or the setup cannot be produced in CI without a human.
   installed `%LOCALAPPDATA%\Programs\AirQlality` path, mock source, KEEP CLOSED),
   `EXP29-proof.log` (28 assertions, `RESULT PASS`, run from a **non-elevated**
   shell: `elevated=False`) - including an upgrade over a running widget (setup
-  exit 0, the running copy closed, a portable copy left alone). The setup is
-  **10.1 MiB** from the 32.6 MiB exe (lzma2/max), vs a 33 MB zip. Suites: core
-  64/64, app 82/82, windowed E2E 33/33 in 276 s - no product code changed, so no
-  re-baseline.
+  exit 0, the running copy closed, a portable copy left alone).
+  `EXP29-released-widget.png`: the same proof again on the **published**
+  `v0.3.0` setup downloaded from the release (SHA-256 re-checked against
+  `SHA256SUMS.txt`), which also proves the `dist` exe starts and renders off the
+  build machine. Sizes for the same 32.6 MiB exe: setup **9.9 MiB**
+  (`10,367,078` bytes), zip **12.5 MiB** - lzma2/max beats deflate, so the
+  installer is the smaller download. Suites: core 64/64, app 82/82, windowed E2E
+  33/33 in 276 s - no product code changed, so no re-baseline.
 - **May touch:** `installer/airqlality.iss` (new), `app/examples/emit_icon.rs`
   (new), `experiments/EXP29/**`, `.github/workflows/release.yml`,
   `.gitignore`, `README.md`, `experiments-overview.md`, branch `EXP29`.
@@ -148,7 +152,15 @@ _Pending._
 - One unproven one-off: the very first proof run found a desktop shortcut even
   though the task is `unchecked`; every later run (many installs, including
   upgrades) never created one. Suspected stale artifact, not reproduced.
-- The published asset itself: `dist` exe + setup are built and proven on CI, so
-  the first tagged release after this branch is the real end-to-end check.
 - Restart after an upgrade: setup stops the running widget and does not start it
   again unless the user asks on the finish page (silent installs stay silent).
+- Signed installers: no certificate, so SmartScreen warns; `SignTool` hooks are
+  left out on purpose until there is a cert.
+
+## Release
+`v0.3.0` published on 2026-10-22 after the `Release` workflow's own 28/28 proof
+(`github.com/Magid-William/AirQlality/releases/tag/v0.3.0`): setup, zip and
+`SHA256SUMS.txt`. Two earlier runs of the same tag failed on **one** assertion -
+the shortcut target compared as a path string against the runner's 8.3 `%TEMP%` -
+so the tag was deleted and re-pushed twice; the installer build and proof were
+green apart from that assertion both times.
