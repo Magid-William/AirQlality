@@ -138,6 +138,18 @@ Limits / not proven:
 - A local `--release` build was made for a field test (machine-bound, EXP26);
   the shipped artifacts are `dist` builds.
 
+## Release
+`v0.4.0` published on 2026-10-26 (`github.com/Magid-William/AirQlality/releases/tag/v0.4.0`)
+from this experiment's merge plus the version bump. Release run `40399873581`
+green in 16m10s: core 64/64, app 86/86, `dist` build, setup built and silently
+installed/upgraded/uninstalled (28/28), then both assets uploaded. Assets:
+setup 9.9 MiB (`10,373,390` bytes), zip 12.5 MiB (`13,067,636` bytes),
+`SHA256SUMS.txt`. CI on `main` (`40399868153`) green in 5m56s.
+
+Not downloaded back to this machine (metered link); the workflow proves the
+uploaded setup on the runner before upload. The local `--release` build stays
+the machine-bound field-test build from EXP26 and is not what was published.
+
 ## Learnings
 - The real path had no clock: `spawn_real` fetches, then sleeps to the next
   `:00`/`:30` (`app/src/schedule.rs`), and only `apply_stack` wrote the series,
