@@ -1,6 +1,6 @@
 # EXP30 - Warn on the data's clock, not the fetch clock
 
-**Status:** `inProg` (started 2026-10-26).
+**Status:** `success` (user, 2026-10-26).
 
 ## Summary
 Every time-dependent output is a snapshot of the last request, so an event at
@@ -100,7 +100,43 @@ to warn before it is a lead on a transition we already hold - not finer polling.
   (EXP18 stays as recorded; EXP30 only stops depending on it).
 
 ## Conclusion (findings)
-_Pending._
+**Success (user, 2026-10-26).** The warning runs on the data's clock now, so the
+lag the user described is gone by construction: nothing that depends on time
+waits for a request.
+
+What landed:
+- `app/src/clock.rs`: a 1-minute, `:00`-aligned evaluation tick plus the
+  `AIRQLALITY_CLOCK_EPOCH` / `AIRQLALITY_CLOCK_SPEED` simulated clock. The fetch
+  schedule keeps real time, so the two clocks cannot fight.
+- `app/src/onset.rs`: one balloon per run, `lead` = 10 min
+  (`AIRQLALITY_NOTIFY_LEAD_SECS`) before its first hour. Identity is the run's
+  absolute hour range: a revision that extends or shifts the same spell stays
+  silent, a new spell after a whole other hour warns again. `notify::Gate`
+  retired; its contract sequences moved here.
+- `ui.rs`: one `reanchor(now)` re-indexes the fused series and every source,
+  re-evaluates, repaints the tray icon and asks the planner. Called by the fetch,
+  the demo ticker and the clock; no network.
+- `tray.rs`: `set_verdict` is icon-only and `warn` transports the planner's
+  decision; the balloon dump gained `at` and `kind`.
+- Evidence: the 16:00 run warned at `15:50:00+02:00` (`from 4:00 PM (in 10
+  min)`) while the widget still read OPEN, the tray went red by 16:0x, and the
+  whole run used **one** fetch round. Commenting out `start_eval_clock` produces
+  **0** balloons: the clock is the fix, not the plumbing. Suites: core 64/64,
+  app 86/86, E2E 35/35 in 296 s.
+
+Limits / not proven:
+- The data is hourly. The lead is a heads-up on the forecast boundary, not a
+  measurement of the next ten minutes; a revision after the balloon cannot
+  retract it and does not warn again for the same spell.
+- The balloon still honours Windows quiet hours / Focus Assist, which can
+  suppress it. The tray icon flips at the boundary regardless, so the tray is
+  the fallback signal.
+- The banner does not yet say "closes 4:00 PM (in 10 min)" (deferred on
+  purpose); the ribbon shows the future.
+- The accelerated E2E proves the arithmetic, the wiring and the Win32 balloon;
+  the real 30 min field observation is the user's own use.
+- A local `--release` build was made for a field test (machine-bound, EXP26);
+  the shipped artifacts are `dist` builds.
 
 ## Learnings
 - The real path had no clock: `spawn_real` fetches, then sleeps to the next
@@ -121,14 +157,13 @@ _Pending._
   what `onset::Planner` decided. `notify_targets()` is read from the tray's
   live state once per tick, so a "Notify me on" toggle still applies without a
   restart.
-- `$env:PATH = "$env:LOCALAPPDATA\mingw64\bin;" + $env:PATH; cargo test -p
-  airqlality --bin airqlality` (86/86), `-p airqlality-core --lib` (64/64),
-  `-p airqlality --test e2e_widget` (35/35, 296 s).
-- `cargo test -p airqlality --test e2e_widget -- --nocapture widget_e2e_warns`
-  runs only the two EXP30 tests (~22 s) and prints the dumps.
-- Recording evidence: set `AIRQLALITY_EVIDENCE_DIR=experiments/EXP30` for the
-  run; `run_onset` then copies `EXP30-{ahead,open}.{png,jsonl,json}` there.
-- Bite-proof: with `widget.start_eval_clock(cx)` commented out, the same test
-  renders the same window but writes **0** notify lines (the 16:00 value is
-  never reached: the only state is the fetch's 15:00 snapshot). The eval tick
-  is the whole fix; the rest is plumbing.
+- Gate commands: `cargo test -p airqlality-core --lib` (64/64), `cargo test -p
+  airqlality --bin airqlality` (86/86), `cargo test -p airqlality --test
+  e2e_widget` (35/35, 296 s). For iteration, the two EXP30 E2Es alone:
+  `cargo test -p airqlality --test e2e_widget -- --nocapture widget_e2e_warns`
+  (~22 s, prints the dumps).
+- Evidence: `AIRQLALITY_EVIDENCE_DIR=experiments/EXP30` makes `run_onset` copy
+  `EXP30-{ahead,open}.{png,jsonl,json}` there. Bite-proof: with
+  `widget.start_eval_clock(cx)` commented out the same test writes **0** notify
+  lines (the 16:00 value is never reached), so the clock is the fix - do not
+  "simplify" it away.
