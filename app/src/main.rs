@@ -10,9 +10,11 @@
 #![windows_subsystem = "windows"]
 
 mod browser;
+mod clock;
 mod commands;
 mod keys;
 mod notify;
+mod onset;
 mod persist;
 mod schedule;
 mod theme;

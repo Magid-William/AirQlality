@@ -1483,6 +1483,241 @@ fn widget_e2e_notify_none_is_silent() {
     );
 }
 
+/// One EXP30 run: the real path, a loopback source whose 16:00 hour is bad, and
+/// the evaluation clock pinned to 15:45 and sped up 120x.
+struct OnsetRun {
+    notify: String,
+    tray: String,
+    fetch: String,
+    requests: usize,
+    log: String,
+    png: std::path::PathBuf,
+}
+
+/// Serve a six-hour Open-Meteo JSON on loopback and run the widget on it.
+///
+/// The evaluation clock starts at 15:45 and advances 2 min per real second, so
+/// the 16:00 transition is fifteen simulated minutes - but only a few real
+/// seconds - away. The refresh period is a week, so a second fetch inside the
+/// run would be a bug, not a timer.
+fn run_onset(tag: &str, wait_secs: u32) -> OnsetRun {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let exe = env!("CARGO_BIN_EXE_airqlality");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("capture.ps1");
+    let appdata = std::env::temp_dir().join(format!(
+        "airqlality-onset-{tag}-appdata-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&appdata);
+    std::fs::create_dir_all(&appdata).expect("create temp APPDATA");
+
+    let png = std::env::temp_dir().join(format!(
+        "airqlality-e2e-onset-{tag}-{}.png",
+        std::process::id()
+    ));
+    let notify = std::env::temp_dir().join(format!(
+        "airqlality-e2e-onset-{tag}-{}.jsonl",
+        std::process::id()
+    ));
+    let tray = std::env::temp_dir().join(format!(
+        "airqlality-e2e-onset-{tag}-tray-{}.json",
+        std::process::id()
+    ));
+    let fetch = std::env::temp_dir().join(format!(
+        "airqlality-e2e-onset-{tag}-fetch-{}.jsonl",
+        std::process::id()
+    ));
+    for path in [&png, &notify, &tray, &fetch] {
+        let _ = std::fs::remove_file(path);
+    }
+
+    // 15:00 open, 16:00+17:00 closed, 18:00 vent, 19:00 open. Epoch seconds are
+    // 2026-01-01 15:00..20:00 at +02:00, the clock's offset.
+    let body = concat!(
+        r#"{"utc_offset_seconds":7200,"hourly":{"time":["#,
+        "1767272400,1767276000,1767279600,1767283200,1767286800,1767290400",
+        r#"],"pm2_5":[12,30,30,20,12,12],"pm10":[19,48,48,32,19,19],"#,
+        r#""us_aqi":[48,120,120,80,48,48]}}"#
+    )
+    .to_string();
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind a loopback port");
+    let port = listener.local_addr().expect("loopback address").port();
+    let hits = Arc::new(AtomicUsize::new(0));
+    let served = hits.clone();
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { break };
+            served.fetch_add(1, Ordering::SeqCst);
+            let mut head = [0u8; 4096];
+            let _ = stream.read(&mut head);
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        }
+    });
+
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&script)
+        .arg("-Exe")
+        .arg(exe)
+        .arg("-Out")
+        .arg(&png)
+        .arg("-WaitSeconds")
+        .arg(wait_secs.to_string())
+        .env("AIRQLALITY_OPENMETEO_URL", format!("http://127.0.0.1:{port}"))
+        // EXP30: the evaluation clock, not the fetch schedule. 2 min per real
+        // second turns the 15 min lead into 7.5 s.
+        .env("AIRQLALITY_CLOCK_EPOCH", "2026-01-01T15:45:00+02:00")
+        .env("AIRQLALITY_CLOCK_SPEED", "120")
+        .env("AIRQLALITY_REFRESH_PERIOD_SECS", "604800")
+        .env("AIRQLALITY_NOTIFY_ON", "closed")
+        .env("AIRQLALITY_NOTIFY_DUMP", &notify)
+        .env("AIRQLALITY_TRAY_DUMP", &tray)
+        .env("AIRQLALITY_FETCH_DUMP", &fetch)
+        // Isolate persistence: a developer's keys would join this stack.
+        .env("APPDATA", &appdata)
+        .env_remove("AIRQLALITY_OPENAQ_KEY")
+        .env_remove("AIRQLALITY_OWM_KEY")
+        .output()
+        .expect("failed to spawn capture.ps1");
+
+    let log = format!(
+        "--- capture stdout ---\n{}\n--- capture stderr ---\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !log.contains("PROCESS_EXITED") && log.contains("SAVED"),
+        "the widget did not render ({tag}):\n{log}"
+    );
+
+    let read = |path: &std::path::Path| std::fs::read_to_string(path).unwrap_or_default();
+    let run = OnsetRun {
+        notify: read(&notify),
+        tray: read(&tray),
+        fetch: read(&fetch),
+        requests: hits.load(Ordering::SeqCst),
+        log,
+        png,
+    };
+    // Keep the evidence when a run is being recorded for an experiment
+    // (`AIRQLALITY_EVIDENCE_DIR`), otherwise clean up after the test.
+    if let Ok(dir) = std::env::var("AIRQLALITY_EVIDENCE_DIR") {
+        let dir = Path::new(&dir);
+        let _ = std::fs::create_dir_all(dir);
+        let _ = std::fs::copy(&run.png, dir.join(format!("EXP30-{tag}.png")));
+        let _ = std::fs::write(dir.join(format!("EXP30-{tag}-notify.jsonl")), &run.notify);
+        let _ = std::fs::write(dir.join(format!("EXP30-{tag}-tray.json")), &run.tray);
+        let _ = std::fs::write(dir.join(format!("EXP30-{tag}-fetch.jsonl")), &run.fetch);
+    }
+    for path in [&notify, &tray, &fetch] {
+        let _ = std::fs::remove_file(path);
+    }
+    let _ = std::fs::remove_dir_all(&appdata);
+    run
+}
+
+/// EXP30: the balloon is on the data's clock. The forecast says 16:00 turns
+/// bad; the app starts at 15:45 and must warn at 15:50 - then flip the icon at
+/// 16:00 - with **one** request, never a second fetch.
+#[test]
+fn widget_e2e_warns_ahead_of_the_data_transition() {
+    let _guard = window_guard();
+    let run = run_onset("ahead", 11);
+    eprintln!(
+        "e2e onset ahead: requests={}\n--- notify ---\n{}--- tray ---\n{}--- fetch ---\n{}",
+        run.requests, run.notify, run.tray, run.fetch
+    );
+
+    let lines: Vec<&str> = run.notify.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(
+        lines.len(),
+        1,
+        "one transition, one balloon - however many ticks pass:\n{}\n{}",
+        run.notify,
+        run.log
+    );
+    let line = lines[0];
+    assert!(line.contains("\"kind\":\"ahead\""), "{line}");
+    assert!(
+        line.contains("\"at\":\"2026-01-01T15:50:"),
+        "the balloon must go out 10 min before the 16:00 run, not at the next fetch:\n{line}"
+    );
+    assert!(
+        line.contains("\"hour\":490910"),
+        "hour is the warned run's first hour (2026-01-01 16:00 +02:00):\n{line}"
+    );
+    assert!(
+        line.contains("from 4:00 PM (in 10 min)"),
+        "the body must name the boundary and the lead:\n{line}"
+    );
+    assert!(
+        line.contains("PM2.5 30"),
+        "the warned reading is the 16:00 value, not the open one:\n{line}"
+    );
+    assert!(line.contains("\"ok\":true"), "the shell rejected the balloon:\n{line}");
+
+    // The icon followed the data's clock too, with no second request.
+    assert!(
+        run.tray.contains("#f85149"),
+        "16:00 must turn the tray red without a fetch: {}",
+        run.tray
+    );
+    assert_eq!(
+        run.requests, 1,
+        "the warning and the flip needed exactly one fetch:\n{}",
+        run.log
+    );
+    assert_eq!(
+        run.fetch.lines().filter(|l| !l.trim().is_empty()).count(),
+        1,
+        "one fetch round for the whole run:\n{}",
+        run.fetch
+    );
+
+    let _ = std::fs::remove_file(&run.png);
+}
+
+/// EXP30: the same run, captured before 16:00 - the balloon is already out
+/// while the verdict and the tray icon are still green. This is the user's
+/// scenario: a heads-up ten minutes before the air changes.
+#[test]
+fn widget_e2e_warns_while_the_verdict_is_still_open() {
+    let _guard = window_guard();
+    let run = run_onset("open", 4);
+    eprintln!(
+        "e2e onset open: requests={}\n--- notify ---\n{}--- tray ---\n{}",
+        run.requests, run.notify, run.tray
+    );
+
+    let lines: Vec<&str> = run.notify.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(lines.len(), 1, "expected the lead balloon:\n{}", run.notify);
+    assert!(
+        lines[0].contains("\"at\":\"2026-01-01T15:50:"),
+        "expected the 15:50 warning:\n{}",
+        lines[0]
+    );
+    assert!(
+        run.tray.contains("#3fb950"),
+        "the warning must precede the verdict: the tray is still open:\n{}",
+        run.tray
+    );
+    assert_eq!(run.requests, 1, "no fetch may be needed to warn:\n{}", run.log);
+
+    let _ = std::fs::remove_file(&run.png);
+}
+
 /// The inferred noise overlay (EXP16). With `AIRQLALITY_NOISE=on` a second,
 /// violet curve is painted on the timeline; the default (off under the mock
 /// seam) paints none, so the pre-EXP16 screenshots stay byte-identical. Runs

@@ -8,8 +8,8 @@ use airqlality_core::{
     AirQualityPoint, AirQualitySource, City, DAY_END_HOUR, DAY_START_HOUR, Decision, Kind, Location,
     MAX_DB, MIN_DB, MockSource, OpenAqSource, OpenMeteoSource, OpenWeatherMapSource, SEARCH_LIMIT,
     Series, SourceError, SourceSeries, Spread, Stack, Thresholds, Verdict, align_to_series,
-    city_by_id, country_name, estimate_for_city, evaluate, mock_stack, night_curve, search,
-    stack as fuse_stack,
+    city_by_id, country_name, estimate_for_city, evaluate, evaluate_hourly, mock_stack, night_curve,
+    now_index_for, search, stack as fuse_stack,
 };
 use gpui::{
     AnyElement, Bounds, Context, FocusHandle, FontWeight, InteractiveElement, KeyDownEvent,
@@ -22,8 +22,11 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use crate::browser;
+use crate::clock as eval_clock;
 use crate::commands::{self, Command};
 use crate::keys::{self, Step};
+use crate::notify;
+use crate::onset::{self, Phase};
 use crate::persist;
 use crate::schedule::until_next_boundary;
 use crate::theme::*;
@@ -302,6 +305,9 @@ pub struct Widget {
     /// The running real-source refresh task. Replacing it drops (cancels) the
     /// previous loop, so switching locations never leaks a refresh.
     fetch_task: Option<Task<()>>,
+    /// Decides *when* a balloon is due (EXP30), from the data's clock. The tray
+    /// only transports what this returns.
+    planner: onset::Planner,
     /// The hour the pointer is over the chart (`None` when it is off the plot).
     /// Drives the crosshair, dot and tooltip; mouse-only (EXP13).
     hover: Option<usize>,
@@ -384,6 +390,7 @@ impl Widget {
             caret_on: true,
             blink_task: None,
             fetch_task: None,
+            planner: onset::Planner::new(),
             hover: None,
             chart_bounds: Rc::new(Cell::new(Bounds::default())),
             noise,
@@ -465,6 +472,10 @@ impl Widget {
             // Real mode: start the fetch loop. The mocks have no fetch to
             // re-run, so the tray's Refresh item stays greyed there.
             widget.spawn_real(cx);
+            // EXP30: a local clock re-derives "now" from the data between
+            // fetches, so the verdict, icon and warning never wait on the
+            // network.
+            widget.start_eval_clock(cx);
         }
 
         widget
@@ -1137,6 +1148,8 @@ impl Widget {
         self.selected = location;
         persist::save(&self.selected);
         self.noise = noise_for(&self.selected);
+        // A different place is a different run (EXP17, EXP30).
+        self.planner.reset();
 
         if !use_mock() {
             // Drop stale data so the previous location's numbers never linger.
@@ -1152,16 +1165,13 @@ impl Widget {
         cx.notify();
     }
 
+    /// Store a single (mock) series and evaluate it at its own "now". The demo
+    /// ticker sets the index before calling [`Self::reanchor`]; the real path
+    /// always anchors from the wall clock.
     fn set_series(&mut self, series: Series) {
-        let decision = evaluate(&series, &self.thresholds);
-        tray_set_verdict(
-            decision.headline,
-            &self.selected.label,
-            series.now().pm2_5,
-            hour_bucket(&series.now().time),
-        );
-        self.decision = Some(decision);
         self.series = Some(series);
+        self.stack = None;
+        self.reanchor(None);
     }
 
     /// Apply a fetch round: fuse whatever came back.
@@ -1232,9 +1242,6 @@ impl Widget {
 
         match fuse_stack(sources, &self.thresholds) {
             Ok(stack) => {
-                let pm2_5 = stack.fusion.series.now().pm2_5;
-                let hour = hour_bucket(&stack.fusion.series.now().time);
-                tray_set_verdict(stack.decision.headline, &self.selected.label, pm2_5, hour);
                 self.series = Some(stack.fusion.series.clone());
                 self.decision = Some(stack.decision.clone());
                 self.stack = Some(stack);
@@ -1245,6 +1252,11 @@ impl Widget {
                 } else {
                     Some(outages.join(" \u{b7} "))
                 };
+                // EXP30: the fetch supplied the data, not "now". Anchor the new
+                // series to the evaluation clock, so a slow response cannot
+                // leave the verdict on the request's minute.
+                let anchor = if use_mock() { None } else { Some(eval_clock::now()) };
+                self.reanchor(anchor);
             }
             Err(e) => {
                 self.error = Some(e.to_string());
@@ -1265,21 +1277,111 @@ impl Widget {
         }
     }
 
-    /// Advance the mock post one hour and re-evaluate, ready for the next repaint.
+    /// Advance the mock post one hour and re-evaluate, ready for the next
+    /// repaint. EXP30 routes this through the same anchor path as the real
+    /// clock, so the mock proves the contract the real app uses.
     fn tick(&mut self) {
         if let Some(series) = self.series.as_mut() {
             series.advance_now();
         }
-        if let Some(series) = self.series.as_ref() {
-            let decision = evaluate(series, &self.thresholds);
-            tray_set_verdict(
-                decision.headline,
-                &self.selected.label,
-                series.now().pm2_5,
-                hour_bucket(&series.now().time),
-            );
-            self.decision = Some(decision);
+        self.reanchor(None);
+    }
+
+    /// Re-derive everything that depends on the clock from the cached series
+    /// (EXP30).
+    ///
+    /// `at = Some(t)` re-indexes the series and every fused source to `t` (the
+    /// wall clock, or the E2E's simulated one). `None` keeps the index the
+    /// caller just set - the demo ticker's hour - and takes that point as
+    /// "now". Then the verdict, the tray icon and the warning plan follow, all
+    /// without a fetch: the data's timestamps are the clock.
+    fn reanchor(&mut self, at: Option<chrono::DateTime<chrono::FixedOffset>>) {
+        let Some(mut series) = self.series.take() else {
+            return;
+        };
+        if let Some(now) = at {
+            series.now_index = now_index_for(&series.points, now);
         }
+        let data_now = series.now().time;
+
+        if let Some(stack) = self.stack.as_mut() {
+            stack.fusion.series.now_index = series.now_index;
+            for source in &mut stack.fusion.sources {
+                source.series.now_index = now_index_for(&source.series.points, at.unwrap_or(data_now));
+            }
+            stack.decision = evaluate_hourly(stack.decision.hourly.clone(), series.now_index);
+            self.decision = Some(stack.decision.clone());
+        } else {
+            self.decision = Some(evaluate(&series, &self.thresholds));
+        }
+        self.series = Some(series);
+
+        self.publish_warning(at.unwrap_or(data_now));
+    }
+
+    /// Recolour the tray icon for the anchored reading and ask the planner
+    /// whether a balloon is due (EXP30). The tray transports; this decides.
+    fn publish_warning(&mut self, now: chrono::DateTime<chrono::FixedOffset>) {
+        let (Some(series), Some(decision)) = (self.series.as_ref(), self.decision.as_ref()) else {
+            return;
+        };
+        let point = series.now();
+        tray_set_verdict(decision.headline, &self.selected.label);
+
+        let targets = tray_targets();
+        let Some(warning) = self
+            .planner
+            .poll(series, decision, now, &targets, notify_lead_secs())
+        else {
+            return;
+        };
+
+        // The message reads in the location's wall clock, whatever offset the
+        // evaluation clock carries.
+        let offset = *point.time.offset();
+        let start = warning.start.with_timezone(&offset);
+        let when = clock(&start, self.clock24);
+        let timing = match warning.phase {
+            Phase::Ahead(minutes) => format!("from {when} (in {minutes} min)"),
+            Phase::Starting => format!("from {when}"),
+            Phase::Late(minutes) => format!("since {when} ({minutes} min ago)"),
+        };
+        let (title, body) = notify::message_at(
+            warning.verdict,
+            &self.selected.label,
+            warning.pm2_5,
+            Some(&timing),
+        );
+        let at = now
+            .with_timezone(&offset)
+            .format("%Y-%m-%dT%H:%M:%S%:z")
+            .to_string();
+        tray_warn(
+            warning.verdict,
+            &title,
+            &body,
+            warning.start_hour,
+            &at,
+            warning.phase.kind(),
+        );
+    }
+
+    /// The local evaluation clock (EXP30): once a minute, re-anchor the cached
+    /// series to "now" and let the verdict, icon and warning follow. It costs
+    /// one wake and nothing else; the fetch loop still owns the data.
+    fn start_eval_clock(&mut self, cx: &mut Context<Self>) {
+        cx.spawn(async move |this, cx| loop {
+            let wait = eval_clock::until_next_tick(eval_clock::now(), eval_clock::speed());
+            cx.background_executor().timer(wait).await;
+            let alive = this.update(cx, |widget, cx| {
+                widget.reanchor(Some(eval_clock::now()));
+                cx.notify();
+            });
+            if alive.is_err() {
+                break; // the window closed
+            }
+        })
+        .detach();
     }
 
     /// Map a pointer position (window space) to the chart hour under it and
@@ -2178,22 +2280,47 @@ fn legend_row(square: impl IntoElement, label: &'static str) -> impl IntoElement
 /// Push the current verdict to the Windows tray icon (no-op elsewhere). Kept
 /// behind a helper so the Windows-only call is invisible to the view code.
 ///
-/// `hour` is the unix-hour bucket of the reading the verdict came from (EXP27):
-/// the notification gate must see a repeated hour as the same red segment, not
-/// as a new one.
+/// Since EXP30 this is only the icon and tooltip: the balloon is decided by the
+/// planner from the data's clock, not triggered by a verdict change.
 #[cfg(windows)]
-fn tray_set_verdict(verdict: Verdict, location: &str, pm2_5: f32, hour: i64) {
-    crate::tray::set_verdict(verdict, location, pm2_5, hour);
+fn tray_set_verdict(verdict: Verdict, location: &str) {
+    crate::tray::set_verdict(verdict, location);
 }
 
 #[cfg(not(windows))]
-fn tray_set_verdict(_verdict: Verdict, _location: &str, _pm2_5: f32, _hour: i64) {}
+fn tray_set_verdict(_verdict: Verdict, _location: &str) {}
 
-/// The unix-hour bucket of one series point, the unit the notification gate
-/// segments red runs by (EXP27).
-fn hour_bucket(time: &chrono::DateTime<chrono::FixedOffset>) -> i64 {
-    time.timestamp() / 3600
+/// The choices the user made in the tray's "Notify me on" submenu (EXP28),
+/// read from the tray's live copy so a toggle applies without a restart.
+#[cfg(windows)]
+fn tray_targets() -> notify::Targets {
+    crate::tray::notify_targets()
 }
+
+#[cfg(not(windows))]
+fn tray_targets() -> notify::Targets {
+    persist::load_notify()
+}
+
+/// How early a balloon goes out (EXP30). `AIRQLALITY_NOTIFY_LEAD_SECS` overrides
+/// it so the timing can be tested or tried without a rebuild; 0 means "at the
+/// boundary, not before".
+fn notify_lead_secs() -> i64 {
+    std::env::var("AIRQLALITY_NOTIFY_LEAD_SECS")
+        .ok()
+        .and_then(|s| s.parse::<i64>().ok())
+        .filter(|secs| *secs >= 0)
+        .unwrap_or(onset::DEFAULT_LEAD_SECS)
+}
+
+/// Queue the balloon the planner decided on (no-op off Windows).
+#[cfg(windows)]
+fn tray_warn(verdict: Verdict, title: &str, body: &str, hour: i64, at: &str, kind: &'static str) {
+    crate::tray::warn(verdict, title, body, hour, at, kind);
+}
+
+#[cfg(not(windows))]
+fn tray_warn(_verdict: Verdict, _title: &str, _body: &str, _hour: i64, _at: &str, _kind: &str) {}
 
 /// Show the tray's muted "fetching" state while a new location loads.
 #[cfg(windows)]

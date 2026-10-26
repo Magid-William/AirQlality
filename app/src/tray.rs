@@ -84,32 +84,50 @@ static TRAY_READY: AtomicBool = AtomicBool::new(false);
 struct State {
     color: u32,
     tip: String,
-    /// The warning decision (EXP17, EXP27): one balloon per run, however many
-    /// refreshes land inside it.
-    gate: notify::Gate,
-    /// Which verdicts may notify (EXP28). `None` until first read, so the
-    /// cold-start warning still honours the saved choice: `set_verdict` runs
-    /// before the tray thread exists.
+    /// Which verdicts may notify (EXP28), shared by the menu's checks and the
+    /// widget's planner. `None` until first read, so a warning planned before
+    /// the tray thread exists still honours the saved choice.
     targets: Option<notify::Targets>,
-    /// A balloon waiting for the tray icon to exist: (title, body, hour,
-    /// verdict). Sent by `add_icon`/`refresh_icon`, then cleared (EXP17).
-    pending: Option<(String, String, i64, Verdict)>,
+    /// A balloon waiting for the tray icon to exist. Sent by
+    /// `add_icon`/`refresh_icon`, then cleared (EXP17).
+    pending: Option<Pending>,
+}
+
+/// A balloon in flight (EXP17, EXP30). The tray transports it; the widget
+/// decided it, including when (`at`) and why (`kind`).
+struct Pending {
+    title: String,
+    body: String,
+    /// The warned run's first hour, as an absolute unix-hour bucket.
+    hour: i64,
+    verdict: Verdict,
+    /// The evaluation instant, in the location's wall clock, to the minute.
+    at: String,
+    /// `ahead` / `now` / `late`.
+    kind: &'static str,
 }
 
 /// The desired icon, shared between the UI thread (writer) and tray thread.
 static STATE: Mutex<State> = Mutex::new(State {
     color: theme::MUTED,
     tip: String::new(),
-    gate: notify::Gate::new(),
     targets: None,
     pending: None,
 });
 
 impl State {
-    /// The chosen notification targets, loaded once from disk (EXP28).
+    /// The chosen notification targets, loaded once from disk (EXP28). The
+    /// tray menu updates this copy, so a toggle takes effect immediately.
     fn targets(&mut self) -> notify::Targets {
         *self.targets.get_or_insert_with(persist::load_notify)
     }
+}
+
+/// The choices the widget's planner must honour, read from the same state the
+/// menu writes (EXP28, EXP30).
+pub fn notify_targets() -> notify::Targets {
+    let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+    state.targets()
 }
 
 /// Map a verdict to the widget's palette (identical to the header chip/legend).
@@ -156,39 +174,58 @@ pub fn start(window_hwnd: isize) {
         .spawn(move || unsafe { run(window_hwnd) });
 }
 
-/// Point the icon at a verdict: colour + tooltip, and warn the user if this
-/// reading starts a fresh run of a verdict they asked about (EXP17, EXP27,
-/// EXP28).
+/// Point the icon at a verdict: colour + tooltip (EXP11).
 ///
-/// `hour` is the unix-hour bucket of the *reading* (`series.now().time`), not
-/// the wall clock: a refresh that re-evaluates the same hour is not a new run.
-pub fn set_verdict(verdict: Verdict, location: &str, pm2_5: f32, hour: i64) {
+/// Since EXP30 this is all it does. The balloon is planned from the data's own
+/// clock by [`crate::onset::Planner`] and delivered through [`warn`], so a
+/// fetch that re-evaluates the same hour can never fire one.
+pub fn set_verdict(verdict: Verdict, location: &str) {
+    let color = color_for(verdict);
+    let tip = format!(
+        "AirQlality \u{00b7} {location} \u{00b7} {}",
+        verdict.label()
+    );
     {
         let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
-        state.color = color_for(verdict);
-        state.tip = format!(
-            "AirQlality \u{00b7} {location} \u{00b7} {}",
-            verdict.label()
-        );
-        let targets = state.targets();
-        if state.gate.observe(verdict, hour, &targets) {
-            let (title, body) = notify::message(verdict, location, pm2_5);
-            state.pending = Some((title, body, hour, verdict));
+        // The evaluation clock repaints once a minute (EXP30); only a real
+        // change needs a new HICON in the shell.
+        if state.color == color && state.tip == tip {
+            return;
         }
+        state.color = color;
+        state.tip = tip;
     }
     nudge();
 }
 
-/// Muted grey while a freshly selected location is fetching. Forgets the last
-/// run, so the next closed reading is a new segment: a location switch should
-/// warn even if the old location was closed too (EXP17).
+/// Queue a balloon the widget's planner has already decided on (EXP30).
+///
+/// `hour` is the warned run's first hour, `at` the evaluation instant and
+/// `kind` one of `ahead` / `now` / `late`; all three reach the E2E dump, so the
+/// timing is asserted at the Win32 boundary, not inferred from the UI.
+pub fn warn(verdict: Verdict, title: &str, body: &str, hour: i64, at: &str, kind: &'static str) {
+    {
+        let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+        state.pending = Some(Pending {
+            title: title.to_string(),
+            body: body.to_string(),
+            hour,
+            verdict,
+            at: at.to_string(),
+            kind,
+        });
+    }
+    nudge();
+}
+
+/// Muted grey while a freshly selected location is fetching. Drops any balloon
+/// that has not been shown yet, because it names the previous location: the
+/// widget's planner is reset for the same reason (EXP17, EXP30).
 pub fn set_loading(location: &str) {
     {
         let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
         state.color = theme::MUTED;
         state.tip = format!("AirQlality \u{00b7} {location} \u{00b7} fetching\u{2026}");
-        state.gate.reset();
-        // Drop any not-yet-shown warning: it names the previous location.
         state.pending = None;
     }
     nudge();
@@ -196,9 +233,8 @@ pub fn set_loading(location: &str) {
 
 /// Muted grey + "refreshing..." while a manual refresh is in flight (EXP22).
 ///
-/// Unlike [`set_loading`] this **keeps** the gate (and any queued balloon): a
-/// refresh that finds the same closed reading is not a new closed run, so it
-/// must not warn the user twice.
+/// Unlike [`set_loading`] this **keeps** any queued balloon: the refresh is
+/// about the same place, and the planner's warning (EXP30) is still valid.
 pub fn set_refreshing(location: &str) {
     {
         let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -291,7 +327,7 @@ pub fn notify_menu_items(targets: &notify::Targets) -> [(u32, &'static str, bool
 }
 
 /// Build the real submenu from the stored targets, so the checks the user sees
-/// and the gate reads come from one source (EXP28).
+/// and the planner reads come from one source (EXP28).
 unsafe fn notify_submenu(targets: &notify::Targets) -> Option<HMENU> {
     let submenu = CreatePopupMenu().ok()?;
     for (id, label, checked) in notify_menu_items(targets) {
@@ -307,7 +343,7 @@ unsafe fn notify_submenu(targets: &notify::Targets) -> Option<HMENU> {
 }
 
 /// Flip one notification choice from the menu and persist it (EXP28). Works
-/// while the widget is hidden: the gate reads this same state.
+/// while the widget is hidden: the planner reads this same state.
 fn toggle_notify(verdict: Verdict) {
     let targets = {
         let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
@@ -439,7 +475,7 @@ unsafe fn show_menu(hwnd: HWND) {
         PCWSTR(keys_label.as_ptr()),
     );
     // Which verdicts may notify: a real submenu of native checks (EXP28). The
-    // checks are read from the same state the gate uses, so they cannot lie.
+    // checks are read from the same state the planner uses, so they cannot lie.
     let targets = {
         let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
         state.targets()
@@ -640,23 +676,31 @@ unsafe fn flush_pending(hwnd: HWND) {
         let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
         state.pending.take()
     };
-    let Some((title, body, hour, verdict)) = info else {
+    let Some(pending) = info else {
         return;
     };
     let mut nid = base_nid(hwnd);
     nid.uFlags = NIF_INFO;
-    nid.szInfoTitle = title_array(&title);
-    nid.szInfo = info_array(&body);
+    nid.szInfoTitle = title_array(&pending.title);
+    nid.szInfo = info_array(&pending.body);
     // A closed window is a warning; the optional opening/venting notes are
     // information (EXP28). All honour Focus Assist / quiet time and keep the
     // default notification sound.
-    nid.dwInfoFlags = if verdict == Verdict::KeepClosed {
+    nid.dwInfoFlags = if pending.verdict == Verdict::KeepClosed {
         NIIF_WARNING | NIIF_RESPECT_QUIET_TIME
     } else {
         NIIF_INFO | NIIF_RESPECT_QUIET_TIME
     };
     let ok = Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool();
-    dump_notify(verdict, &title, &body, hour, ok);
+    dump_notify(
+        pending.verdict,
+        &pending.title,
+        &pending.body,
+        pending.hour,
+        &pending.at,
+        pending.kind,
+        ok,
+    );
 }
 
 /// `NIM_DELETE` the icon (called from `WM_DESTROY`).
@@ -776,11 +820,20 @@ fn dump(color: u32, tip: &str, ok: bool) {
 }
 
 /// Test seam: with `AIRQLALITY_NOTIFY_DUMP=<path>`, append one JSON line per
-/// balloon actually sent, so the E2E can assert the gate fired and the shell
-/// accepted the call, at the Win32 boundary (EXP17, EXP27). `verdict` says
-/// *which* promise the balloon belongs to (EXP28) and `hour` is the reading's
-/// unix-hour bucket.
-fn dump_notify(verdict: Verdict, title: &str, body: &str, hour: i64, ok: bool) {
+/// balloon actually sent, so the E2E can assert the planner fired and the shell
+/// accepted the call, at the Win32 boundary (EXP17, EXP27, EXP30). `verdict`
+/// says *which* promise the balloon belongs to (EXP28), `hour` is the warned
+/// run's first hour, `at` the evaluation instant and `kind` whether the warning
+/// was ahead of, at, or after its run started.
+fn dump_notify(
+    verdict: Verdict,
+    title: &str,
+    body: &str,
+    hour: i64,
+    at: &str,
+    kind: &str,
+    ok: bool,
+) {
     let Some(path) = std::env::var_os("AIRQLALITY_NOTIFY_DUMP") else {
         return;
     };
@@ -791,7 +844,8 @@ fn dump_notify(verdict: Verdict, title: &str, body: &str, hour: i64, ok: bool) {
         Verdict::Open => "open",
     };
     let line = format!(
-        "{{\"verdict\":\"{verdict}\",\"hour\":{hour},\"title\":\"{}\",\"body\":\"{}\",\"ok\":{ok}}}\n",
+        "{{\"verdict\":\"{verdict}\",\"hour\":{hour},\"at\":\"{}\",\"kind\":\"{kind}\",\"title\":\"{}\",\"body\":\"{}\",\"ok\":{ok}}}\n",
+        esc(at),
         esc(title),
         esc(body)
     );
@@ -901,41 +955,55 @@ mod tests {
         }
     }
 
+    /// EXP30: the tray only transports. `set_verdict` recolours and never
+    /// queues a balloon (the planner decides); a loading drops a queued balloon
+    /// because it names the previous place, while a refresh keeps it.
     #[test]
-    fn a_refresh_keeps_the_run_and_a_loading_forgets_it() {
-        // Both states are muted, but only `set_loading` starts a new closed
-        // run. Checked on the shared state so the notification gate (EXP17,
-        // EXP27) cannot regress silently. Pin the choices: the test must not
-        // depend on the developer's own notify.txt.
+    fn a_verdict_only_recolours_and_a_loading_drops_a_pending_balloon() {
+        set_verdict(Verdict::KeepClosed, "Cairo, Egypt");
         {
-            let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
-            state.targets = Some(notify::Targets::CLOSED_ONLY);
+            let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+            assert_eq!(state.color, theme::CLOSED);
+            assert!(state.tip.contains("KEEP CLOSED"), "tip: {}", state.tip);
+            assert!(
+                state.pending.is_none(),
+                "a plain verdict change must not warn; the planner does"
+            );
         }
-        set_verdict(Verdict::KeepClosed, "Cairo, Egypt", 26.0, 100);
+
+        warn(
+            Verdict::KeepClosed,
+            "KEEP THE WINDOW CLOSED",
+            "Cairo, Egypt \u{b7} PM2.5 30 \u{b5}g/m\u{b3} \u{b7} from 4:00 PM (in 10 min)",
+            100,
+            "2026-01-01T15:50+02:00",
+            "ahead",
+        );
         {
-            let mut state = STATE.lock().unwrap_or_else(|e| e.into_inner());
-            state.pending = None; // drop the balloon this call queued
-            assert_ne!(state.gate, notify::Gate::new());
+            let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
+            let pending = state.pending.as_ref().expect("the balloon was queued");
+            assert_eq!(pending.kind, "ahead");
+            assert_eq!(pending.hour, 100);
         }
+
         set_refreshing("Cairo, Egypt");
         {
             let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
             assert_eq!(state.color, theme::MUTED);
-            assert_ne!(
-                state.gate,
-                notify::Gate::new(),
-                "a refresh must not forget the closed run"
-            );
-            assert!(state.pending.is_none());
             assert!(state.tip.contains("refreshing"));
+            assert!(
+                state.pending.is_some(),
+                "a refresh is the same place: its warning survives"
+            );
         }
+
         set_loading("Cairo, Egypt");
         {
             let state = STATE.lock().unwrap_or_else(|e| e.into_inner());
-            assert_eq!(
-                state.gate,
-                notify::Gate::new(),
-                "a location switch is a new run"
+            assert_eq!(state.color, theme::MUTED);
+            assert!(
+                state.pending.is_none(),
+                "a location switch must drop the previous place's balloon"
             );
         }
     }
