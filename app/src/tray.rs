@@ -19,12 +19,12 @@
 #![cfg(windows)]
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 use std::sync::Mutex;
 use std::thread;
 
 use airqlality_core::Verdict;
-use windows::core::PCWSTR;
+use windows::core::{w, PCWSTR};
 use windows::Win32::Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Shell::{
@@ -35,11 +35,11 @@ use windows::Win32::UI::Shell::{
 use windows::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
     DispatchMessageW, GetCursorPos, GetMessageW, GetSystemMetrics, IsWindow, IsWindowVisible,
-    PostMessageW, PostQuitMessage, RegisterClassW, SetForegroundWindow, ShowWindow, TrackPopupMenu,
-    TranslateMessage, HICON, HMENU, MENU_ITEM_FLAGS, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR,
-    MF_STRING, MSG, SM_CXSMICON, SM_CYSMICON, SW_HIDE, SW_RESTORE, TPM_NONOTIFY, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, WINDOW_EX_STYLE, WM_APP, WM_CLOSE, WM_DESTROY, WM_LBUTTONUP, WM_NULL,
-    WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
+    PostMessageW, PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SendNotifyMessageW,
+    SetForegroundWindow, ShowWindow, TrackPopupMenu, TranslateMessage, HICON, HMENU, HWND_BROADCAST,
+    MENU_ITEM_FLAGS, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSG, SM_CXSMICON,
+    SM_CYSMICON, SW_HIDE, SW_RESTORE, TPM_NONOTIFY, TPM_RETURNCMD, TPM_RIGHTBUTTON, WINDOW_EX_STYLE,
+    WM_APP, WM_CLOSE, WM_DESTROY, WM_LBUTTONUP, WM_NULL, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
 };
 
 use crate::commands::{self, Command};
@@ -80,6 +80,13 @@ static MAIN_HWND: AtomicIsize = AtomicIsize::new(0);
 static QUIT_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// Whether the shell accepted the icon (so hiding always has a way back).
 static TRAY_READY: AtomicBool = AtomicBool::new(false);
+/// The `TaskbarCreated` message id, registered on the tray thread (0 until
+/// then, and 0 if registration failed). The shell and taskbar replacements
+/// (komorebi-bar's systray spy) broadcast it when every icon was dropped.
+static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
+/// How many `NIM_ADD` calls were made: 1 at launch, +1 per `TaskbarCreated`
+/// (EXP31). The tray dump carries it so the E2E can prove a re-add happened.
+static ADDS: AtomicU32 = AtomicU32::new(0);
 
 struct State {
     color: u32,
@@ -290,6 +297,13 @@ pub fn close_action(quit_requested: bool, tray_ready: bool) -> CloseAction {
     } else {
         CloseAction::Hide
     }
+}
+
+/// Whether `msg` is the broadcast that says the taskbar was (re)created and so
+/// every tray icon was dropped (EXP31). Pure, and defensive about `registered`
+/// being 0 when `RegisterWindowMessageW` failed: 0 must never match anything.
+pub fn is_taskbar_created(msg: u32, registered: u32) -> bool {
+    registered != 0 && msg == registered
 }
 
 /// The toggle menu item's label for the current window visibility.
@@ -572,10 +586,40 @@ fn maybe_spawn_refresh_seam() {
         });
 }
 
+/// Test seam: `AIRQLALITY_TRAY_TASKBAR_CREATED_MS=<n>` broadcasts the same
+/// `TaskbarCreated` message the shell (and komorebi-bar's systray spy) sends at
+/// login / after an Explorer restart, so the E2E can exercise the re-add path
+/// without killing Explorer (EXP31).
+fn maybe_spawn_taskbar_created_seam() {
+    let Some(ms) = std::env::var("AIRQLALITY_TRAY_TASKBAR_CREATED_MS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+    else {
+        return;
+    };
+    let _ = thread::Builder::new()
+        .name("airqlality-tray-taskbar-created-seam".into())
+        .spawn(move || {
+            thread::sleep(std::time::Duration::from_millis(ms));
+            let msg = TASKBAR_CREATED.load(Ordering::SeqCst);
+            if msg != 0 {
+                unsafe {
+                    let _ = SendNotifyMessageW(HWND_BROADCAST, msg, WPARAM(0), LPARAM(0));
+                }
+            }
+        });
+}
+
 /// The tray thread: register a class, create the hidden window, add the icon and
 /// pump messages until the process exits.
 unsafe fn run(main_hwnd: isize) {
     MAIN_HWND.store(main_hwnd, Ordering::SeqCst);
+
+    // The shell broadcasts this when the taskbar is (re)created: after an
+    // Explorer restart, on a primary-display DPI change, and on startup of a
+    // taskbar replacement such as komorebi-bar's systray spy. Every icon is
+    // assumed dropped, so ours must be added again (EXP31).
+    TASKBAR_CREATED.store(RegisterWindowMessageW(w!("TaskbarCreated")), Ordering::SeqCst);
 
     let hinstance = match GetModuleHandleW(None) {
         Ok(h) => HINSTANCE(h.0),
@@ -635,12 +679,21 @@ unsafe fn add_icon(hwnd: HWND) {
     nid.hIcon = icon;
     nid.szTip = tip_array(&tip);
     let added = Shell_NotifyIconW(NIM_ADD, &nid).as_bool();
+    ADDS.fetch_add(1, Ordering::SeqCst);
+    // A taskbar replacement broadcasts `TaskbarCreated` while the real shell
+    // still holds our icon, so `NIM_ADD` can be refused. Repaint it in place
+    // instead, which is what `NIM_MODIFY` is for (EXP31).
+    let added = added || Shell_NotifyIconW(NIM_MODIFY, &nid).as_bool();
     if added {
-        // Only now can a hidden window be restored from the tray.
-        TRAY_READY.store(true, Ordering::SeqCst);
-        maybe_spawn_quit_seam();
-        maybe_spawn_refresh_seam();
-        startup::maybe_toggle_seam();
+        // Only now can a hidden window be restored from the tray. The one-shot
+        // test seams belong to the first successful add, not to a re-add after
+        // a taskbar replacement (EXP31).
+        if !TRAY_READY.swap(true, Ordering::SeqCst) {
+            maybe_spawn_quit_seam();
+            maybe_spawn_refresh_seam();
+            maybe_spawn_taskbar_created_seam();
+            startup::maybe_toggle_seam();
+        }
     }
     // Version 4 makes LOWORD(lParam) the event, so clicks are decoded correctly.
     nid.Anonymous.uVersion = NOTIFYICON_VERSION_4;
@@ -740,6 +793,12 @@ unsafe extern "system" fn wndproc(
             refresh_icon(hwnd);
             LRESULT(0)
         }
+        // The taskbar was (re)created, so the shell no longer holds our icon:
+        // put it back from the live state (EXP31).
+        _ if is_taskbar_created(msg, TASKBAR_CREATED.load(Ordering::SeqCst)) => {
+            add_icon(hwnd);
+            LRESULT(0)
+        }
         WM_DESTROY => {
             remove_icon(hwnd);
             PostQuitMessage(0);
@@ -815,7 +874,9 @@ fn dump(color: u32, tip: &str, ok: bool) {
         return;
     };
     let escaped = tip.replace('\\', "\\\\").replace('"', "\\\"");
-    let json = format!("{{\"color\":\"#{color:06x}\",\"tip\":\"{escaped}\",\"ok\":{ok}}}");
+    let adds = ADDS.load(Ordering::SeqCst);
+    let json =
+        format!("{{\"color\":\"#{color:06x}\",\"tip\":\"{escaped}\",\"ok\":{ok},\"adds\":{adds}}}");
     let _ = std::fs::write(path, json);
 }
 
@@ -893,6 +954,15 @@ mod tests {
         assert_eq!(close_action(true, true), CloseAction::Quit);
         assert_eq!(close_action(false, false), CloseAction::Quit);
         assert_eq!(close_action(true, false), CloseAction::Quit);
+    }
+
+    #[test]
+    fn only_the_registered_taskbar_created_message_matches() {
+        assert!(is_taskbar_created(0xc123, 0xc123));
+        assert!(!is_taskbar_created(WM_TRAY, 0xc123));
+        // A failed registration returns 0; 0 must never match a real message.
+        assert!(!is_taskbar_created(0, 0));
+        assert!(!is_taskbar_created(WM_CLOSE, 0));
     }
 
     #[test]

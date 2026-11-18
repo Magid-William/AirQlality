@@ -775,6 +775,70 @@ fn widget_e2e_tray_icon_is_closed_red() {
     let _ = std::fs::remove_file(&dump);
 }
 
+/// A taskbar replacement (komorebi-bar's systray spy) or an Explorer restart
+/// broadcasts `TaskbarCreated`; the tray must add the icon again from the live
+/// state, not just once at launch (EXP31). The app's
+/// `AIRQLALITY_TRAY_TASKBAR_CREATED_MS` seam sends the same broadcast the shell
+/// does, and the dump then reports a second `NIM_ADD` with the same verdict.
+#[test]
+fn widget_e2e_tray_survives_taskbar_created() {
+    let _guard = window_guard();
+    let exe = env!("CARGO_BIN_EXE_airqlality");
+    let script = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("capture.ps1");
+    let png = std::env::temp_dir().join(format!("airqlality-e2e-tb-{}.png", std::process::id()));
+    let dump = std::env::temp_dir().join(format!("airqlality-e2e-tb-{}.json", std::process::id()));
+    let _ = std::fs::remove_file(&png);
+    let _ = std::fs::remove_file(&dump);
+
+    let output = Command::new("powershell")
+        .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+        .arg(&script)
+        .arg("-Exe")
+        .arg(exe)
+        .arg("-Out")
+        .arg(&png)
+        .env("AIRQLALITY_SOURCE", "mock")
+        .env("AIRQLALITY_FREEZE_NOW", "1")
+        .env("AIRQLALITY_TRAY_DUMP", &dump)
+        // Well before the 6 s capture, so the dump the test reads is the one
+        // written after the re-add.
+        .env("AIRQLALITY_TRAY_TASKBAR_CREATED_MS", "1500")
+        .output()
+        .expect("failed to spawn capture.ps1");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let log = format!("--- capture stdout ---\n{stdout}");
+    assert!(
+        !stdout.contains("PROCESS_EXITED") && stdout.contains("SAVED"),
+        "app did not render:\n{log}"
+    );
+
+    let state = std::fs::read_to_string(&dump)
+        .unwrap_or_else(|e| panic!("tray dump not written ({e}):\n{log}"));
+    eprintln!("e2e tray (taskbar created): {state}");
+    assert!(
+        state.contains("\"adds\":2"),
+        "TaskbarCreated did not re-add the icon:\n{state}"
+    );
+    assert!(
+        state.contains("\"ok\":true"),
+        "the re-add was rejected by Shell_NotifyIcon:\n{state}"
+    );
+    assert!(
+        state.contains("\"color\":\"#f85149\""),
+        "the re-added icon lost the verdict colour:\n{state}"
+    );
+    assert!(
+        state.contains("KEEP CLOSED"),
+        "the re-added icon lost the verdict tooltip:\n{state}"
+    );
+
+    let _ = std::fs::remove_file(&png);
+    let _ = std::fs::remove_file(&dump);
+}
+
 /// Closing the window must hide it to the tray, not quit: the process stays
 /// alive, the window is no longer visible, and the tray icon is still there.
 /// EXP11.
