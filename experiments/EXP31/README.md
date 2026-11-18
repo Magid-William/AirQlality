@@ -121,6 +121,20 @@ Limits / not proven:
 - The field acceptance is the user's, not a capture of the bar: komorebi-bar is
   outside this repo, so no screenshot of its tray is part of the evidence.
 
+## Release
+`v0.4.1` published on 2026-11-18
+(`github.com/Magid-William/AirQlality/releases/tag/v0.4.1`). CI on `main`
+(`44317498712`, commit `70e1206`) green in both jobs, including the windowed
+E2E gate. Release run `44320520262` green: tag agrees with `Cargo.toml`, core
+and app tests, `dist` build, Inno setup built and proven 28/28 (silent
+install/upgrade/uninstall), then both assets and the checksums uploaded.
+Assets: setup 9.8 MiB (`10,262,098` bytes, sha256
+`9e10840a...fce3`), zip 12.3 MiB (`12,848,039` bytes, sha256
+`bb6426ed...930a`), `SHA256SUMS.txt`.
+
+Only the 208-byte `SHA256SUMS.txt` was downloaded back to this machine (metered
+link); the workflow proves the uploaded setup on the runner before upload.
+
 ## Learnings
 - `Shell_NotifyIcon` reaches the taskbar by messaging the window with the
   `Shell_TrayWnd` class; komorebi-bar (`systray-util`) inserts a topmost spy
