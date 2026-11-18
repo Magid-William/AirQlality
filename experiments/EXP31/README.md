@@ -1,6 +1,6 @@
 # EXP31 - The tray icon survives a taskbar replacement
 
-**Status:** `inProg` (started 2026-11-18).
+**Status:** `success` (user, 2026-11-18).
 
 ## Summary
 Register `TaskbarCreated` on the tray thread and re-add the icon when it
@@ -92,33 +92,50 @@ alone cannot fix it).
   step.
 
 ## Conclusion (findings)
-_Pending._
+**Success (user, 2026-11-18).** The tray icon is no longer a one-shot: it
+re-registers when the taskbar says it was recreated, which is the only thing an
+app can do when komorebi-bar (or Explorer) starts with an empty icon table.
+
+What landed:
+- `app/src/tray.rs`: `TaskbarCreated` registered on the tray thread; `wndproc`
+  re-runs `add_icon` from the live `STATE` (colour, tooltip, pending balloon).
+  `NIM_ADD` refused because the real shell still holds the icon (a
+  bar-initiated broadcast) falls back to `NIM_MODIFY` with the same data;
+  `systray-util` turns an unknown-icon update into an add, so the bar shows it.
+  One-shot seams now fire on the first successful add only; the dump carries
+  `adds`.
+- `app/tests/e2e_widget.rs`: `widget_e2e_tray_survives_taskbar_created`; the
+  `AIRQLALITY_TRAY_TASKBAR_CREATED_MS` seam broadcasts the real message.
+- Evidence: `EXP31-taskbar-created.json` =
+  `{"color":"#f85149","tip":"...KEEP CLOSED","ok":true,"adds":2}`; app unit
+  87/87; new E2E green; full windowed suite 34/36 - the two failures are the
+  pre-existing komorebi tiling conflict (proven on `main` with EXP31 stashed),
+  not this change.
+
+Limits / not proven:
+- Re-announcing only helps apps that handle the message. The bar still cannot
+  enumerate icons added before it started, so other apps that ignore
+  `TaskbarCreated` stay hidden until they restart.
+- No retry timer: if a future shell refuses both `NIM_ADD` and `NIM_MODIFY` at
+  broadcast time, the icon stays gone and the dump says `ok:false`.
+- The field acceptance is the user's, not a capture of the bar: komorebi-bar is
+  outside this repo, so no screenshot of its tray is part of the evidence.
 
 ## Learnings
-- `Shell_NotifyIcon` reaches the taskbar by messaging the window found with the
+- `Shell_NotifyIcon` reaches the taskbar by messaging the window with the
   `Shell_TrayWnd` class; komorebi-bar (`systray-util`) inserts a topmost spy
-  window with that class, relays the `WM_COPYDATA`, and on Windows 11 can only
-  learn existing icons by broadcasting `TaskbarCreated` at startup. An app that
-  ignores the message is invisible to the bar until it restarts.
-- When the shell still holds the icon (a bar-initiated broadcast, not an
-  Explorer restart), `NIM_ADD` returns FALSE. The correct follow-up is
-  `NIM_MODIFY` with the same `NOTIFYICONDATAW`; the spy maps it to an update
-  and, for an unknown icon, adds it. Without this fallback the dump reads
-  `{"adds":2,"ok":false}` and a real re-announce would be a no-op.
-- Gate commands: `cargo test -p airqlality --bin airqlality` (87/87), then the
-  single new E2E with `cargo test -p airqlality --test e2e_widget -- --nocapture
-  widget_e2e_tray_survives_taskbar_created` (~15 s, prints the dump); full
-  `e2e_widget` once at the end.
-- **Environment, not this change:** with komorebi running, the widget window is
-  tiled to 1296x1420 at (1272,28), so `widget_e2e_renders_expected_verdict`
-  (geometry bound) and `widget_e2e_shows_day_night_wave` (fixed-band pixel
-  census) fail. Proven pre-existing: the same test fails with EXP31 stashed on
-  `main`. Full suite is 34/36, including the new test. Either add an ignore rule
-  for `airqlality.exe` in the komorebi config, or pause komorebi before the
-  windowed suite.
+  window with that class, relays the `WM_COPYDATA`, and on Windows 11 learns
+  existing icons only by broadcasting `TaskbarCreated` at startup. Ignore the
+  message and the bar shows nothing.
+- When the shell still holds the icon, `NIM_ADD` returns FALSE; follow with
+  `NIM_MODIFY` and the same `NOTIFYICONDATAW`. `systray-util` maps an update of
+  an unknown icon to an add, so the re-announce works for a bar that never saw
+  the original add. Without it the dump reads `{"adds":2,"ok":false}`.
+- Gates: `cargo test -p airqlality --bin airqlality` (87/87) and
+  `cargo test -p airqlality --test e2e_widget -- --nocapture
+  widget_e2e_tray_survives_taskbar_created` (~15 s, prints the dump). Under
+  komorebi the widget is tiled to 1296x1420, so the strict geometry/pixel tests
+  fail on `main` too; add a komorebi ignore rule for `airqlality.exe` or pause
+  komorebi before the full suite.
 - Do not run `cargo fmt --all` here: this machine's rustfmt rewrites ~23
-  untouched files (different formatting generation than the tree). It was run
-  once and fully reverted; keep the surrounding style by hand.
-- Evidence dump: `experiments/EXP31/EXP31-taskbar-created.json` -
-  `{"color":"#f85149","tip":"AirQlality · Cairo, Egypt · KEEP CLOSED","ok":true,"adds":2}`
-  (read it as UTF-8; the `·` is `C2 B7`).
+  untouched files. It was run once and fully reverted; keep the style by hand.
